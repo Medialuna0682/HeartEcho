@@ -57,6 +57,7 @@ import { diagnoseProtocol, ensureProtocol, startProtocol, stopProtocol, isPortLi
 import { listSessions, scopeLabel } from "./lib/storage.mjs";
 import { archiveOnce, writeDiary } from "./lib/life.mjs";
 import { forecast as fetchWeather, summarize as summarizeWeather } from "./lib/weather.mjs";
+import { recoverMissedMessages } from "./lib/recovery.mjs";
 
 const argv = process.argv.slice(2);
 const has = (flag) => argv.includes(flag);
@@ -388,6 +389,13 @@ async function main() {
       log.info(`已接管 QQ：${info.nickname}（${info.user_id}）`);
     }
     audit({ eventType: "qq_connected", detail: { selfId: client.selfId, nickname: client.status.nickname } });
+    // 连上就补一遍历史：断线期间、重启期间对方发来的消息不至于凭空消失
+    recoverMissedMessages({ client, extraPeers: [String(cfg.bot.masterId || "")] })
+      .then((result) => {
+        if (result.added) log.info(`补回了 ${result.added} 条之前没接到的消息（不会触发回复，只补记录）`);
+        else log.debug("没有漏掉的消息");
+      })
+      .catch((error) => log.debug(`补历史消息失败（不影响正常收发）：${error?.message ?? error}`));
     await greetIfNeeded();
   });
 

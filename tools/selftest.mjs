@@ -74,6 +74,7 @@ async function main() {
   const llmMod = await import("../lib/llm.mjs");
   const { ChatEngine } = await import("../lib/chat.mjs");
   const configMod = await import("../lib/config.mjs");
+  const recoveryMod = await import("../lib/recovery.mjs");
   const weatherMod = await import("../lib/weather.mjs");
   const { Scheduler } = scheduler;
 
@@ -723,6 +724,132 @@ async function main() {
     engine.stop();
     saveConfig({ chat: before });
     return `回了一句，${Math.round(2)} 秒后又补了一句：${calls[0]?.text}`;
+  });
+
+  /* --------------------------- 消息不丢（收不到的问题） --------------------------- */
+
+  group("消息不丢：被拦下的、连发的、断线期间的");
+
+  const makeEngine = () => {
+    const resolvers = [];
+    const sent = [];
+    const stubLlm = {
+      speak: () =>
+        new Promise((resolve) =>
+          resolvers.push((text = "嗯。") => resolve({ text, requestId: "stub", usage: { cost: 0, tokensIn: 0, tokensOut: 0, usageSource: "estimated" } })),
+        ),
+    };
+    const stubClient = {
+      selfId: SELF,
+      sendPrivateMsg: async (peerId, body) => {
+        sent.push({ peerId, body });
+        return { message_id: `m-${sent.length}` };
+      },
+      sendGroupMsg: async (groupId, body) => {
+        sent.push({ groupId, body });
+        return { message_id: `g-${sent.length}` };
+      },
+    };
+    const stubScheduler = { noteUserReply() {}, deliver: async () => null };
+    const engine = new ChatEngine({ client: stubClient, llm: stubLlm, scheduler: stubScheduler });
+    return { engine, resolvers, sent };
+  };
+
+  const privateEvent = (userId, messageId, text) =>
+    normalizeEvent(
+      { post_type: "message", message_type: "private", self_id: SELF, user_id: userId, message_id: messageId, time: Math.floor(Date.now() / 1000), message: [{ type: "text", data: { text } }] },
+      SELF,
+    );
+
+  await test("FR-911", "被闸门拦下的消息也必须入库（否则面板看起来就是没收到的）", async () => {
+    const before = getConfig();
+    const scope = `private_${STRANGER}`;
+    db.run("delete from messages where scope_key = ?", [scope]);
+    db.run("delete from rate_events", []);
+    // 把频率卡到 1 条/小时，第二条一定被拦
+    saveConfig({ group: { rate: { ...before.group.rate, enabled: true, applyToPrivate: true, perUserPerHour: 1, perUserPerDay: 1, globalPerDay: 0, maxConsecutive: 0, minGapSeconds: 0 } } });
+    const { engine, resolvers } = makeEngine();
+    const first = engine.handle(privateEvent(STRANGER, 7001, "第一条"));
+    await new Promise((r) => setTimeout(r, 20));
+    resolvers.shift()?.("在的。");
+    await first;
+    const inbound = () => Number(db.one("select count(*) as n from messages where scope_key = ? and direction = 'in'", [scope])?.n ?? 0);
+    const c1 = inbound();
+    const second = await engine.handle(privateEvent(STRANGER, 7002, "第二条（这条会被拦）"));
+    const c2 = inbound();
+    assert(second.replied === false, "第二条不应该被回复");
+    assert(/已经聊了不少/.test(String(second.reason ?? "")), `第二条应该被频率闸门拦下，实际：${second.reason}`);
+    assert(c1 === 1 && c2 === 2, `被拦下的消息也必须入库：${c1} → ${c2}`);
+    assert(second.stored === true, "返回值要标明消息已经记录了");
+    engine.stop();
+    saveConfig({ group: { rate: before.group.rate } });
+    return `被拦但入库：${c2} 条都在库里`;
+  });
+
+  await test("FR-912", "主人私聊不限流（他的话不能被丢掉）", () => {
+    const before = getConfig();
+    saveConfig({ group: { rate: { ...before.group.rate, enabled: true, applyToPrivate: true, perUserPerHour: 2, perUserPerDay: 2, globalPerDay: 0, maxConsecutive: 8, minGapSeconds: 15 } } });
+    const bucket = `private:${MASTER}`;
+    policy.noteReply({ kind: "private", peerId: String(MASTER) });
+    policy.noteReply({ kind: "private", peerId: String(MASTER) });
+    policy.noteReply({ kind: "private", peerId: String(MASTER) });
+    const masterCheck = policy.rateCheck({ kind: "private", peerId: String(MASTER), isMaster: true });
+    const strangerCheck = policy.rateCheck({ kind: "private", peerId: STRANGER, isMaster: false });
+    assert(masterCheck.ok, `主人私聊不该被限流，实际：${masterCheck.reason}`);
+    saveConfig({ group: { rate: before.group.rate } });
+    return `主人 ok（exempt=${masterCheck.exempt ?? "-"}）；陌生人仍受限(${strangerCheck.ok ? "ok" : strangerCheck.reason})`;
+  });
+
+  await test("FR-913", "上一轮还没回完时，新消息先排队再合并处理（不丢）", async () => {
+    const before = getConfig();
+    const scope = `private_${STRANGER}`;
+    db.run("delete from messages where scope_key = ?", [scope]);
+    db.run("delete from rate_events", []);
+    saveConfig({ group: { rate: { ...before.group.rate, enabled: false } }, chat: { ...before.chat, firstDelayMs: 0, typingDelayMs: 0 } });
+    const { engine, resolvers, sent } = makeEngine();
+    const p1 = engine.handle(privateEvent(STRANGER, 7101, "在吗"));
+    await new Promise((r) => setTimeout(r, 30));
+    const queued = await engine.handle(privateEvent(STRANGER, 7102, "我下班了"));
+    const queued2 = await engine.handle(privateEvent(STRANGER, 7103, "今天好累"));
+    assert(queued.reason === "queued" && queued2.reason === "queued", `连发应该排队，实际：${queued.reason} / ${queued2.reason}`);
+    assert(queued2.queued === 2, `应该攒了 2 条，实际 ${queued2.queued}`);
+    resolvers.shift()?.("嗯。");
+    await p1;
+    await new Promise((r) => setTimeout(r, 300));
+    assert(resolvers.length >= 1, "排队的两条应该被合并成一轮继续处理");
+    resolvers.shift()?.("辛苦啦。");
+    await new Promise((r) => setTimeout(r, 400));
+    const inboundCount = Number(db.one("select count(*) as n from messages where scope_key = ? and direction = 'in'", [scope])?.n ?? 0);
+    assert(inboundCount === 3, `三条都要在库里，实际 ${inboundCount} 条`);
+    assert(sent.length >= 2, `应该至少回了两次（第一轮 + 合并那一轮），实际 ${sent.length} 次`);
+    engine.stop();
+    saveConfig({ group: { rate: before.group.rate }, chat: { ...before.chat } });
+    return `3 条全入库，回了 ${sent.length} 次（第一条回一次，后两条合并回一次）`;
+  });
+
+  await test("FR-914", "断线/重启期间漏掉的消息能补回来（并且重复补不会写两遍）", async () => {
+    const scope = `private_${MASTER}`;
+    db.run("delete from messages where scope_key = ?", [scope]);
+    const now = Math.floor(Date.now() / 1000);
+    const history = {
+      messages: [
+        { time: now - 300, message_type: "private", message_id: 8801, user_id: MASTER, message: [{ type: "text", data: { text: "断线时发的第一条" } }], sender: { user_id: MASTER, nickname: "阿岚" } },
+        { time: now - 280, message_type: "private", message_id: 8802, user_id: MASTER, message: [{ type: "text", data: { text: "断线时发的第二条" } }], sender: { user_id: MASTER, nickname: "阿岚" } },
+        // 自己发的不该被补进来
+        { time: now - 260, message_type: "private", message_id: 8803, user_id: SELF, message: [{ type: "text", data: { text: "我自己发的" } }], sender: { user_id: SELF, nickname: "我" } },
+      ],
+    };
+    let calls = 0;
+    const fakeClient = { selfId: SELF, callHttp: async () => { calls += 1; return history; } };
+    const first = await recoveryMod.recoverPrivateFor({ client: fakeClient, peerId: MASTER });
+    assert(first.added === 2, `应该补回 2 条（跳过自己发的），实际 ${first.added}`);
+    assert(first.skipped === 1, `自己发的那条应该被跳过，实际 skipped=${first.skipped}`);
+    assert(storage.messageCount(scope) === 2, `库里应该有 2 条，实际 ${storage.messageCount(scope)}`);
+    const again = await recoveryMod.recoverPrivateFor({ client: fakeClient, peerId: MASTER });
+    assert(again.added === 0, `重复补不应该再写，实际又写了 ${again.added} 条`);
+    assert(storage.messageCount(scope) === 2, "重复补之后条数不该变");
+    assert(calls === 2, "每次都真的问了协议端一次");
+    return `补回 ${first.added} 条，第二次 +${again.added} 条（幂等）`;
   });
 
   /* --------------------------------- 天气 --------------------------------- */
