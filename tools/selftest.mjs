@@ -776,6 +776,89 @@ async function main() {
     return block.split("\n")[1];
   });
 
+  await test("FR-908", "能识别「我这边是大晴天」和「别再说了」", () => {
+    weatherMod.clearWeatherFeedback();
+    const corr = weatherMod.detectWeatherFeedback("我这边没下雨，是大晴天");
+    assert(corr && corr.type === "correction", `纠正没识别出来：${JSON.stringify(corr)}`);
+    assert(/晴天/.test(corr.note), `要为模型留下「他那边实际情况」：${corr.note}`);
+    assert(weatherMod.detectWeatherFeedback("武汉今天大太阳啊")?.type === "correction", "「大太阳」也要能识别");
+    assert(weatherMod.detectWeatherFeedback("别再说天气了")?.type === "stop", "叫停没识别出来");
+    assert(weatherMod.detectWeatherFeedback("你烦不烦")?.type === "stop", "不耐烦也要当作叫停");
+    assert(weatherMod.detectWeatherFeedback("今天公司好忙") === null, "普通聊天不能被误判");
+    assert(weatherMod.detectWeatherFeedback("我在写代码") === null, "普通聊天不能被误判");
+    return `纠正=${corr.note}；叫停=stop；普通=null`;
+  });
+
+  await test("FR-909", "被纠正后：天气块闭嘴，并记住对方那边的情况", () => {
+    weatherMod.clearWeatherFeedback();
+    const fake = {
+      ok: true,
+      city: "武汉",
+      today: { code: 61, text: "小雨", kind: "rain", max: 20, min: 12, rainProb: 90, rainSum: 3, windMax: 10, uvMax: 2 },
+      tomorrow: null,
+    };
+    // 正常情况下聊天里能拿到天气参考，但必须明确「别主动播报」
+    const block = weatherMod.cachedWeatherBlock(fake);
+    assert(/不要主动播报天气/.test(block), "天气块必须禁止她主动播报");
+    assert(!/一定要提醒/.test(block), `天气块不能再下「一定要提醒」的命令（这正是「不停提醒」的根因）`);
+
+    // 「我知道了」在没有刚提过天气时不算叫停
+    assert(weatherMod.detectWeatherFeedback("知道了") === null, "没提过天气时「知道了」只是普通应答");
+
+    // 用户纠正之后：天气块必须消失，并且提示词里要写清「以他说的为准」
+    weatherMod.recordWeatherMention(["rain"]);
+    const ack = weatherMod.detectWeatherFeedback("知道了");
+    assert(ack && ack.type === "ack", "刚提过天气后说「知道了」应该算叫停");
+
+    weatherMod.recordWeatherFeedback({ type: "correction", note: "是大晴天" });
+    assert(weatherMod.isWeatherMuted().muted, "纠正后应该进入静音");
+    assert(weatherMod.cachedWeatherBlock(fake) === "", "静音期间聊天里不能再出现天气块");
+    const fbBlock = weatherMod.weatherFeedbackBlock();
+    assert(/大晴天/.test(fbBlock), "提示词里要带上对方说过的实际情况");
+    assert(/承认他说得对/.test(fbBlock), "要告诉她「先认错」这个具体动作，否则她会绕回预报");
+    assert(/不要拿预报反驳/.test(fbBlock), "提示词里要明确禁止用预报反驳");
+    assert(weatherMod.isWeatherMuted().note === "是大晴天", "要记住对方那边实际是什么天气");
+
+    // 「叫停」是另一条分支：没有 note，只要求她闭嘴
+    weatherMod.clearWeatherFeedback();
+    weatherMod.recordWeatherFeedback({ type: "stop" });
+    assert(weatherMod.isWeatherMuted().muted, "叫停后应该进入静音");
+    const stopBlock = weatherMod.weatherFeedbackBlock();
+    assert(/不要再主动提天气/.test(stopBlock), "叫停分支要明确「不要再主动提天气」");
+    assert(weatherMod.cachedWeatherBlock(fake) === "", "叫停期间聊天里不能再出现天气块");
+
+    weatherMod.clearWeatherFeedback();
+    assert(!weatherMod.isWeatherMuted().muted, "恢复后应该退出静音");
+    assert(weatherMod.cachedWeatherBlock(fake) !== "", "恢复后天气块要回来");
+    return "纠正 → 静音 + 记住「是大晴天」；恢复 → 正常";
+  });
+
+  await test("FR-910", "只有明显影响出门的天气才值得专门发一条", () => {
+    const mk = (rainProb, max) => ({
+      ok: true,
+      city: "测试市",
+      today: {
+        code: rainProb > 50 ? 61 : 1,
+        text: rainProb > 50 ? "小雨" : "晴间多云",
+        kind: rainProb > 50 ? "rain" : "clear",
+        max,
+        min: 18,
+        rainProb,
+        rainSum: rainProb > 50 ? 3 : 0,
+        windMax: 10,
+        uvMax: 3,
+      },
+      tomorrow: null,
+    });
+    const heavy = weatherMod.actionableAlerts(weatherMod.buildAlerts(mk(90, 24)));
+    const light = weatherMod.actionableAlerts(weatherMod.buildAlerts(mk(35, 24)));
+    const mild = weatherMod.actionableAlerts(weatherMod.buildAlerts(mk(0, 34)));
+    assert(heavy.some((item) => item.id === "rain" && item.level === "warn"), "降雨概率 90% 应该是 warn 级");
+    assert(light.length === 0, `降雨概率 35% 不该专门发一条，实际 ${JSON.stringify(light.map((item) => item.id))}`);
+    assert(mild.length === 0, `34℃ 只是有点热，不该专门发一条，实际 ${JSON.stringify(mild.map((item) => item.id))}`);
+    return `90% → 发（warn）；35% → 不发；34℃ → 不发`;
+  });
+
 
   /* ------------------------------ 存储与恢复 ------------------------------ */
 
