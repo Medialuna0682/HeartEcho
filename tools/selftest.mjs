@@ -827,6 +827,140 @@ async function main() {
     return `3 条全入库，回了 ${sent.length} 次（第一条回一次，后两条合并回一次）`;
   });
 
+  /* ------------------------- 卡壳（只做铺垫、没有下文） ------------------------- */
+
+  group("卡壳与记忆：只说不做、记不住");
+
+  await test("FR-918", "只说了开场白时自动接着说（正文接在后面发）", async () => {
+    const before = getConfig();
+    const scope = `private_${STRANGER}`;
+    db.run("delete from messages where scope_key = ?", [scope]);
+    db.run("delete from rate_events", []);
+    saveConfig({
+      group: { rate: { ...before.group.rate, enabled: false } },
+      chat: { ...before.chat, firstDelayMs: 0, typingDelayMs: 0, antiStall: true, followUp: { ...before.chat.followUp, enabled: false } },
+    });
+    const { engine, resolvers, sent } = makeEngine();
+    const pending = engine.handle(privateEvent(STRANGER, 7201, "你先说说你的看法"));
+    await new Promise((r) => setTimeout(r, 30));
+    eq(resolvers.length, 1, "应该已经开始生成");
+    resolvers.shift()?.("嗯，我按我理解的说哦，不专业的地方你别笑我呀。");
+    await new Promise((r) => setTimeout(r, 80));
+    eq(resolvers.length, 1, "只说了开场白之后，应该再要一次续写");
+    resolvers.shift()?.("情感倒错是情绪和场合对不上呢。");
+    await pending;
+    eq(sent.length, 2, `应该发两条（开场白 + 正文），实际 ${sent.length} 条`);
+    assert(/别笑我/.test(sent[0].body), `第一条应该是原来的开场白，实际：${sent[0].body}`);
+    assert(/情绪和场合对不上/.test(sent[1].body), `第二条应该是正文，实际：${sent[1].body}`);
+    engine.stop();
+    saveConfig({ group: { rate: before.group.rate }, chat: { ...before.chat } });
+    return `${sent.map((item) => item.body.slice(0, 10)).join(" → ")}`;
+  });
+
+  await test("FR-919", "续写又只是开场白时不硬凑，而且这一轮不追话", async () => {
+    const before = getConfig();
+    const origRandom = Math.random;
+    // 追话本身是概率的，这里把随机数钉死，测的才是「卡壳就不追」而不是「这次没抽中」
+    Math.random = () => 0;
+    try {
+      const scope = `private_${STRANGER}`;
+      db.run("delete from messages where scope_key = ?", [scope]);
+      db.run("delete from rate_events", []);
+      saveConfig({
+        group: { rate: { ...before.group.rate, enabled: false } },
+        chat: {
+          ...before.chat,
+          firstDelayMs: 0,
+          typingDelayMs: 0,
+          antiStall: true,
+          activity: 100,
+          followUp: { ...before.chat.followUp, enabled: true, chance: 1, delaySec: 2, maxPerTurn: 1 },
+        },
+      });
+      const { engine, resolvers, sent } = makeEngine();
+      const pending = engine.handle(privateEvent(STRANGER, 7202, "接着说"));
+      await new Promise((r) => setTimeout(r, 30));
+      resolvers.shift()?.("嗯，我按我理解的说哦，别笑我呀。");
+      await new Promise((r) => setTimeout(r, 80));
+      eq(resolvers.length, 1, "应该尝试过一次续写");
+      resolvers.shift()?.("那我讲讲我懂的哦，不一定准呀。");
+      const out = await pending;
+      eq(sent.length, 1, `续写也没正文时只发原来那条，实际 ${sent.length} 条`);
+      eq(out.followUp?.scheduled, false, "卡壳的这一轮不该再追话");
+      assert(/卡在开场白/.test(String(out.followUp?.reason)), `不追话的原因应该是卡壳，实际：${out.followUp?.reason}`);
+      engine.stop();
+      saveConfig({ group: { rate: before.group.rate }, chat: { ...before.chat } });
+      return `只发了 1 条，追话理由：${out.followUp.reason}`;
+    } finally {
+      Math.random = origRandom;
+    }
+  });
+
+  await test("FR-920", "「你说吧」这种短句不会清空记忆；记忆归属也不再用机器人自己的 QQ", () => {
+    const scope = `private_${STRANGER}`;
+    // 复现旧数据：归档时把归属写成了机器人自己
+    const added = memory.addMemory({
+      scopeKey: scope,
+      content: "他说学校只有三个食堂，吃了四年基本吃遍",
+      category: "fact",
+      sourceType: "observed",
+      subjectId: String(SELF),
+      confidence: 0.9,
+      importance: 0.8,
+      characterId: "selftest",
+      accountId: String(SELF),
+    });
+    assert(added?.id, "记忆应该写入成功");
+    const beforeFix = memory.retrieveMemories({ scopeKey: scope, query: "食堂", subjectId: String(STRANGER), limit: 5 });
+    eq(beforeFix.length, 0, "修复前应该检索不到——这正是「她什么都记不住」的根因");
+    const fixed = memory.repairMemorySubjects({ botId: String(SELF) });
+    assert(fixed.fixed >= 1, `应该修正至少 1 条，实际 ${fixed.fixed}`);
+    const afterFix = memory.retrieveMemories({ scopeKey: scope, query: "食堂", subjectId: String(STRANGER), limit: 5 });
+    assert(afterFix.length >= 1, "修复后同一个查询应该能命中");
+    const low = memory.retrieveMemories({ scopeKey: scope, query: "你说吧", subjectId: String(STRANGER), limit: 5 });
+    assert(low.length >= 1, "「你说吧」没有话题，不该把记忆清空");
+    assert(memory.isLowInformationQuery("你说吧"), "「你说吧」应该判为低信息");
+    assert(!memory.isLowInformationQuery("食堂"), "「食堂」是实打实的话题，不能判成低信息");
+    assert(!memory.isLowInformationQuery("然后呢") === false, "「然后呢」应该判为低信息");
+    const unrelated = memory.retrieveMemories({ scopeKey: scope, query: "量子场论重整化", subjectId: String(STRANGER), limit: 5 });
+    eq(unrelated.length, 0, "有话题但确实没记过时，不该乱塞记忆");
+    return `修 ${fixed.fixed} 条；「食堂」${afterFix.length} 条，「你说吧」${low.length} 条`;
+  });
+
+  await test("FR-921", "置顶事实不受检索影响，永远进提示词", () => {
+    const scope = `private_${STRANGER}`;
+    const manual = memory.addManualMemory({ scopeKey: scope, content: "他是学土木的，明年考研", subjectId: String(STRANGER), characterId: "selftest" });
+    assert(manual?.id, "手写事实应该写入成功");
+    const facts = memory.pinnedFacts({ scopeKey: scope });
+    assert(facts.some((item) => /土木/.test(item)), `置顶事实应该被取出来，实际：${JSON.stringify(facts)}`);
+    const block = memory.memoryBlock({ scopeKey: scope, query: "量子场论重整化", subjectId: String(STRANGER) }).block;
+    assert(/土木/.test(block), `置顶事实应该出现在记忆块里，实际：${block.slice(0, 80)}`);
+    return `置顶 ${facts.length} 条：${facts[0]?.slice(0, 20)}`;
+  });
+
+  await test("FR-922", "认得「只做铺垫」的各种说法，也不误伤真正简短的回答", () => {
+    const stalls = [
+      "嗯，我按我理解的说哦，不专业的地方你别笑我呀。",
+      "嗯……那我说说我懂的那一点点哦，不一定准呢。",
+      "好哦，那我直接讲啦。",
+      "嗯……知道一点点呢。",
+      "等你想听的时候，我再慢慢讲给你听哦",
+      "好哦，那我讲给你听，是书里看来的，说得笨你别笑呀。",
+      "嗯，那我按我知道的说一点哦，不准的话你别笑我呀。",
+    ];
+    for (const text of stalls) assert(util.isStallReply(text, { userText: "你说吧" }), `应该判为卡壳：${text}`);
+    const normal = [
+      "好哦，我等你。",
+      "对了，锅里温着饭呢，别看书看忘了哦。",
+      "我不会消失的。你来看我的时候，我一定在。",
+      "情感倒错是情绪和场合对不上呢。",
+      "我也不会说什么漂亮话，你别笑我呀",
+    ];
+    for (const text of normal) assert(!util.isStallReply(text, { userText: "我今天好难过" }), `不该判成卡壳：${text}`);
+    assert(util.isStallReply(["嗯，我按我理解的说哦，", "不专业的地方你别笑我呀。"], { userText: "你说吧" }), "多个气泡拼起来也要能认出来");
+    return `${stalls.length} 种说法都认得，${normal.length} 种正常回复都没误伤`;
+  });
+
   await test("FR-914", "断线/重启期间漏掉的消息能补回来（并且重复补不会写两遍）", async () => {
     const scope = `private_${MASTER}`;
     db.run("delete from messages where scope_key = ?", [scope]);

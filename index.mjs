@@ -185,6 +185,17 @@ async function main() {
   pruneLogs(14);
   getDb();
   migrate();
+  /*
+   * 修一次历史记忆的归属：
+   * 早期归档把记忆挂在了「机器人自己的 QQ」名下，检索按对方 QQ 过滤就永远命中不到，
+   * 表现为「她什么都记不住」。这里幂等地把私聊作用域里的这些行改回对方。
+   */
+  try {
+    const { repairMemorySubjects } = await import("./lib/memory.mjs");
+    repairMemorySubjects({ botId: cfg.bot.selfId });
+  } catch (error) {
+    log.warn(`修正记忆归属失败（不影响启动）：${error?.message ?? error}`);
+  }
 
   const budgetGate = new BudgetGate();
   const llm = new LlmGateway({ budgetGate });
