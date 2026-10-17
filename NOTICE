@@ -1,0 +1,26 @@
+心语 · HeartEcho
+Copyright (C) 2026 RCEY-123
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published
+by the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+---
+
+本程序是自由软件：你可以依据自由软件基金会发布的 GNU Affero 通用公共许可证
+（第 3 版，或你选择的任何更新版本）的条款重新分发和/或修改它。
+
+本程序的分发是希望它有用，但不提供任何担保，甚至不提供适销性或特定用途
+适用性的默示担保。详见 GNU Affero 通用公共许可证全文（LICENSE 文件）。
+
+第三方组件不在本许可范围内：协议端（SnowLuma / NapCat 等）由各自作者
+独立授权，本项目既不内嵌也不修改它。

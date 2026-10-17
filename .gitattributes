@@ -1,0 +1,19 @@
+# 心语 · HeartEcho —— git 属性
+#
+# 顺序很重要：git 里「最后一条匹配的规则生效」，所以通配的 * 必须写在最前面，
+# 具体的例外写在后面。
+
+# 默认：文本文件按 LF 归一化
+* text=auto eol=lf
+
+# 启动脚本是 GBK(936) 编码 + CRLF 换行，绝对不能让 git 做换行转换。
+# 一旦被转成 LF，Windows 上双击就会报「不是内部或外部命令」，或者窗口一闪就没。
+*.bat -text
+*.cmd -text
+
+# PowerShell 脚本（托盘脚本是运行时生成的，这里是给手写脚本留的规矩）
+*.ps1 text eol=crlf
+
+# 图片按二进制处理
+*.png binary
+*.ico binary

@@ -1,0 +1,8 @@
+{
+  "dataDir": "",
+  "logDir": "",
+  "snowlumaDir": "",
+  "autoStartProtocol": true,
+  "openPanelOnStart": true,
+  "closeWindowTo": "ask"
+}
