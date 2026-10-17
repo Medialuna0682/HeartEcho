@@ -852,6 +852,52 @@ async function main() {
     return `补回 ${first.added} 条，第二次 +${again.added} 条（幂等）`;
   });
 
+  /* ------------------------------ 模型可用性与切换 ------------------------------ */
+
+  group("模型可用性（模型下线/改名之后自动纠正）");
+
+  await test("FR-915", "认得「模型不存在」这类报错，不把它当网络问题重试", () => {
+    const cases = [
+      ['{"error":{"message":"Not found the model moonshot-v1-8k or Permission denied","type":"resource_not_found_error"}}', true],
+      ["The model `gpt-5` does not exist or you do not have access to it.", true],
+      ["invalid model name: claude-x", true],
+      ['{"error":{"message":"invalid temperature: only 1 is allowed for this model"}}', true],
+      ["HTTP 500: upstream timeout", false],
+      ["fetch failed ECONNRESET", false],
+      ['{"error":{"message":"Incorrect API key provided"}}', false],
+    ];
+    for (const [text, expected] of cases) {
+      const actual = llmMod.LlmGateway.isModelError(text);
+      assert(actual === expected, `「${text.slice(0, 50)}」应该判定为 ${expected}，实际 ${actual}`);
+    }
+    return "6 个样本全部判对";
+  });
+
+  await test("FR-916", "自动挑模型时优先选通用对话模型，避开 code/vision 专用", async () => {
+    const gateway = new llmMod.LlmGateway();
+    gateway.listModels = async () => ({
+      ok: true,
+      // 故意把专用模型排在前面，模拟服务商真实的返回顺序
+      ids: ["kimi-k2.7-code-highspeed", "kimi-k2.7-code", "kimi-k3", "kimi-k2.6"],
+    });
+    const before = getConfig().llm.profiles.default;
+    saveConfig({ llm: { profiles: { default: { ...before, provider: "moonshot", model: "moonshot-v1-8k" } } } });
+    const picked = await gateway.ensureUsableModel({ badModel: "moonshot-v1-8k", persist: false });
+    assert(picked.ok, `应该能挑出一个：${picked.message}`);
+    assert(!/code/i.test(picked.model), `不该挑专用模型，实际挑了 ${picked.model}`);
+    saveConfig({ llm: { profiles: { default: before } } });
+    return `从 ${picked.ids.length} 个里挑了 ${picked.model}`;
+  });
+
+  await test("FR-917", "面板能改「聊天用哪个模型」，并同步上下文与看图能力", async () => {
+    const before = getConfig().llm.profiles.default;
+    const preset = (configMod.findProvider("moonshot")?.models ?? []).find((item) => item.id === "kimi-k2.6");
+    assert(preset, "预设里应该有 kimi-k2.6");
+    assert(preset.vision === true, "kimi-k2.6 应该标记为支持看图（实测过）");
+    saveConfig({ llm: { profiles: { default: before } } });
+    return `kimi-k2.6 上下文 ${Math.round(preset.contextTokens / 1000)}k、支持看图`;
+  });
+
   /* --------------------------------- 天气 --------------------------------- */
 
   group("天气与主动提醒");
