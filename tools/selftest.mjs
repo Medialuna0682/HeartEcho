@@ -61,12 +61,13 @@ async function main() {
   const db = await import("../lib/db.mjs");
   db.getDb();
   const { getConfig, saveConfig, loadConfig, saveCharacter, loadCharacter, activeCharacterId, listCharacters, newCharacterId, profileFor } = await import("../lib/config.mjs");
-  const { normalizeEvent, OneBot } = await import("../lib/onebot.mjs");
+  const { normalizeEvent, OneBot, extractFiles } = await import("../lib/onebot.mjs");
   const storage = await import("../lib/storage.mjs");
   const memory = await import("../lib/memory.mjs");
   const policy = await import("../lib/policy.mjs");
   const budget = await import("../lib/budget.mjs");
   const util = await import("../lib/util.mjs");
+  const filesMod = await import("../lib/files.mjs");
   const logMod = await import("../lib/log.mjs");
   const apiMod = await import("../lib/api.mjs");
   const life = await import("../lib/life.mjs");
@@ -959,6 +960,134 @@ async function main() {
     for (const text of normal) assert(!util.isStallReply(text, { userText: "我今天好难过" }), `不该判成卡壳：${text}`);
     assert(util.isStallReply(["嗯，我按我理解的说哦，", "不专业的地方你别笑我呀。"], { userText: "你说吧" }), "多个气泡拼起来也要能认出来");
     return `${stalls.length} 种说法都认得，${normal.length} 种正常回复都没误伤`;
+  });
+
+  await test("FR-923", "对方发来的文件会真的下载并读出文字（GBK 也认，读不了的说实话）", async () => {
+    const before = getConfig();
+    saveConfig({ chat: { ...before.chat, files: { enabled: true, maxBytes: 1048576, maxChars: 5000, maxPerMessage: 3 } } });
+    // 「你好\n中文测试」的 GBK 字节（Windows 记事本默认就是这个编码）
+    const gbk = Buffer.from([0xc4, 0xe3, 0xba, 0xc3, 0x0a, 0xd6, 0xd0, 0xce, 0xc4, 0xb2, 0xe2, 0xca, 0xd4]);
+    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0]);
+    const byName = { "笔记.txt": gbk, "图.png": png };
+    let downloaded = 0;
+    const stub = {
+      selfId: SELF,
+      downloadFile: async (file) => {
+        downloaded += 1;
+        const buffer = byName[file.name];
+        if (!buffer) throw new Error("直链过期");
+        return { buffer, source: "test", bytes: buffer.length };
+      },
+    };
+    const engine = new ChatEngine({ client: stub, llm: { speak: async () => ({ text: "", usage: {} }) }, scheduler: { deliver: async () => null, noteUserReply() {} } });
+    const event = { kind: "private", scopeKey: `private_${STRANGER}`, senderId: String(STRANGER), groupId: "" };
+
+    const got = await engine.collectFiles({ ...event, files: [{ name: "笔记.txt", size: gbk.length }, { name: "图.png", size: png.length }] });
+    eq(got.length, 2, "两个文件都要走到");
+    assert(got[0].ok, `txt 应该读得出来，实际：${got[0].note}`);
+    eq(got[0].text, "你好\n中文测试", "GBK 应该被正确解码");
+    eq(got[0].encoding, "gb18030", `编码识别不对：${got[0].encoding}`);
+    assert(!got[1].ok && /图片/.test(got[1].note), `png 应该说明读不出文字，实际：${got[1].note}`);
+
+    const tooBig = await engine.collectFiles({ ...event, files: [{ name: "大.txt", size: 999 }] });
+    assert(tooBig[0].ok === false, "下载失败要留下原因，不能悄悄当没发生");
+
+    // 原始消息段 → 文件名 / file_id / 直链都要能取到
+    const segs = extractFiles([
+      { type: "text", data: { text: "看这个" } },
+      { type: "file", data: { name: "笔记.txt", file: "笔记.txt", file_id: "abc_123", file_size: 12, url: "http://x/y" } },
+    ]);
+    eq(segs.length, 1, "应该抽出一个文件段");
+    eq(segs[0].name, "笔记.txt", "文件名不对");
+    eq(segs[0].fileId, "abc_123", "file_id 不对");
+    assert(segs[0].size === 12 && segs[0].url === "http://x/y", "大小和直链不对");
+
+    saveConfig({ chat: { ...before.chat } });
+    return `下载 ${downloaded} 次；「你好/中文测试」按 ${got[0].encoding} 解出；png 老实说读不出；超限留原因`;
+  });
+
+  await test("FR-924", "文件内容会进提示词，读不出来的文件变成一句实话", () => {
+    const ok = llmMod.buildUserContent("你看下这个", [], [
+      { ok: true, name: "笔记.txt", sizeText: "12 B", kindLabel: "文字", chars: 7, encoding: "gb18030", truncated: false, text: "你好\n中文测试" },
+    ]);
+    assert(typeof ok === "string" && /文件内容开始/.test(ok) && /中文测试/.test(ok), `文件正文应该进提示词，实际：${String(ok).slice(0, 120)}`);
+    assert(/笔记\.txt/.test(ok), "要带文件名");
+    assert(/你看下这个/.test(ok), "对方原话不能被文件内容顶掉");
+
+    const bad = llmMod.buildUserContent("", [], [{ ok: false, name: "报告.pdf", sizeText: "1.2 MB", note: "这是个PDF（.pdf），我读不出里面的文字" }]);
+    assert(/读不出里面的文字/.test(bad), `读不出来要明说，实际：${bad}`);
+
+    const big = llmMod.buildUserContent("", [], [
+      { ok: true, name: "长.txt", chars: 60000, truncated: true, text: "开头……结尾" },
+    ]);
+    assert(/只读了开头和结尾/.test(big), "截断要在提示词里标出来");
+
+    // 图片 + 文件同时发
+    const mixed = llmMod.buildUserContent("两个都看看", [{ dataUrl: "data:image/png;base64,AAA" }], [
+      { ok: true, name: "a.txt", chars: 3, text: "abc" },
+    ]);
+    assert(Array.isArray(mixed) && mixed[0].type === "text" && /abc/.test(mixed[0].text), "图文混发时文字部分要带上文件");
+    assert(mixed.some((item) => item.type === "image_url"), "图片也不能丢");
+
+    // 提示词里必须写清「不许假装读过」
+    const character = loadCharacter(activeCharacterId()) ?? {};
+    const system = llmMod.buildSystemPrompt(character, { masterName: "指挥官", facts: [], extra: "", relationship: "", memory: "", isGroup: false, useEmoji: true, style: getConfig().chat });
+    assert(/读不出里面的文字/.test(system) && /不要假装读过/.test(system), "系统提示词缺少「读不出就别编」的硬约束");
+    return "正文进提示词、截断有标注、图文混发不丢、系统提示词带反编造约束";
+  });
+
+  await test("FR-925", "文件不只收到那轮能看：之后几轮还留着（keepTurns），过了就丢", async () => {
+    const before = getConfig();
+    saveConfig({ chat: { ...before.chat, files: { enabled: true, maxBytes: 1048576, maxChars: 5000, maxPerMessage: 3, keepTurns: 2 } } });
+    const seen = [];
+    const engine = new ChatEngine({
+      client: {
+        selfId: SELF,
+        downloadFile: async () => ({ buffer: Buffer.from("第一章 甲乙丙\n第二章 丁戊己", "utf8"), source: "test", bytes: 30 }),
+      },
+      llm: {
+        speak: async (character, userText, opts) => {
+          seen.push((opts.files ?? []).map((f) => ({ name: f.name, replay: Boolean(f.replay), hasText: Boolean(f.text) })));
+          return { text: "嗯，我看过了哦，写得挺细的。", usage: {}, requestId: "stub" };
+        },
+      },
+      scheduler: { deliver: async () => null, noteUserReply() {} },
+    });
+    const scope = `private_${STRANGER}`;
+    const baseEvent = {
+      eventId: "keep",
+      kind: "private",
+      scopeType: "private",
+      scopeId: String(STRANGER),
+      scopeKey: scope,
+      senderId: String(STRANGER),
+      senderName: "阿岚",
+      groupId: "",
+      accountId: String(SELF),
+      messageId: "keep-1",
+      timestampMs: Date.now(),
+      traceId: "keep",
+      segments: [],
+      images: [],
+      isMention: false,
+    };
+
+    const files = await engine.collectFiles({ ...baseEvent, files: [{ name: "小结.txt", size: 30 }] });
+    eq(files.length, 1, "应该读到一个文件");
+    await engine.generate({ event: { ...baseEvent, text: "看看这个" }, images: [], files });
+    await engine.generate({ event: { ...baseEvent, text: "第二章写了什么" }, images: [], files: [] });
+    await engine.generate({ event: { ...baseEvent, text: "那第一章呢" }, images: [], files: [] });
+    await engine.generate({ event: { ...baseEvent, text: "算了聊点别的" }, images: [], files: [] });
+
+    eq(seen[0].length, 1, "第一轮应该带文件");
+    assert(!seen[0][0].replay && seen[0][0].hasText, "第一轮是刚收到的文件");
+    eq(seen[1].length, 1, "第二轮应该还留着（keepTurns=2）");
+    assert(seen[1][0].replay && seen[1][0].hasText, "第二轮应该以「之前发来的」身份带上");
+    eq(seen[2].length, 1, "第三轮还剩最后一次");
+    eq(seen[3].length, 0, "第四轮应该已经丢掉");
+
+    saveConfig({ chat: { ...before.chat } });
+    return `第 1/2/3/4 轮带文件数：${seen.map((item) => item.length).join(" / ")}`;
   });
 
   await test("FR-914", "断线/重启期间漏掉的消息能补回来（并且重复补不会写两遍）", async () => {
