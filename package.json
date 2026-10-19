@@ -16,6 +16,7 @@
     "tray": "node index.mjs --tray",
     "probe": "node index.mjs --probe",
     "selftest": "node tools/selftest.mjs",
+    "test:security": "node --test tools/security-test.mjs",
     "smoke": "node tools/smoke.mjs",
     "build:exe": "node tools/build-exe.mjs",
     "check:pages": "node tools/check-pages.mjs",
