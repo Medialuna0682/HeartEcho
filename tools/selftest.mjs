@@ -26,6 +26,10 @@ fs.mkdirSync(TMP, { recursive: true });
 process.env.HEARTECHO_DATA_DIR = TMP;
 process.env.HEARTECHO_LOG_DIR = path.join(TMP, "logs");
 process.env.HEARTECHO_LOG_LEVEL = "warn";
+// 多实例的登记表和 instances/ 也指到临时目录，别写进真实程序目录
+process.env.HEARTECHO_INSTANCES_HOME = path.join(TMP, "app");
+// 「这个号被谁占着」的占位文件同样隔离，别动用户真实的占用记录
+process.env.HEARTECHO_CLAIM_DIR = path.join(TMP, "claims");
 
 const results = [];
 let currentGroup = "";
@@ -1205,6 +1209,125 @@ async function main() {
     assert(tokens >= 2048, `日记的 maxTokens 太小（${tokens}），思考型模型会把额度花光导致正文为空`);
     assert(result.skipped === false && result.text, `日记应该写出来，实际：${result.reason || ""}`);
     return `maxTokens = ${tokens}，写出 ${result.text.length} 字`;
+  });
+
+  await test("FR-930", "多实例：一个账号只能一个实例，新实例有独立目录/端口/配置", async () => {
+    const inst = await import("../lib/instances.mjs");
+    const fsMod = await import("node:fs");
+    const NEW_QQ = "10000091";
+    const before = getConfig();
+    // 别用真端口：自检只验证目录和配置写对了
+    const created = await inst.createInstance({ name: "自检实例", accountId: NEW_QQ, masterId: "10000092", masterName: "阿岚", characterId: activeCharacterId(), copyProtocolDir: false });
+    assert(created.panelPort && created.wsPort && created.httpPort && created.webuiPort, "三个端口都要分到");
+    eq(new Set([created.panelPort, created.wsPort, created.httpPort]).size, 3, "端口不能互相重复");
+    const dir = created.dir;
+    assert(fsMod.existsSync(path.join(dir, "心语设置.json")), "实例目录里应该有 心语设置.json");
+    const seed = JSON.parse(fsMod.readFileSync(path.join(dir, "data", "config.json"), "utf8"));
+    eq(String(seed.bot.selfId), NEW_QQ, "新实例应该用新的机器人 QQ");
+    eq(String(seed.bot.masterId), "10000092", "对方 QQ 要写进去");
+    eq(Number(seed.bot.panelPort), created.panelPort, "面板端口要写进去");
+    assert(seed.bot.onebotWsUrl.includes(String(created.wsPort)), "OneBot 地址要用自己的端口");
+    assert(fsMod.existsSync(path.join(dir, "data", "characters", activeCharacterId() + ".json")), "角色卡应该复制过去");
+    // 设置文件必须指向实例自己的 data / protocol，否则会和主实例抢
+    const settings = JSON.parse(fsMod.readFileSync(path.join(dir, "心语设置.json"), "utf8"));
+    eq(settings.dataDir, "data", "dataDir 应该是相对路径，指向实例自己");
+    eq(settings.snowlumaDir, "protocol", "协议端也应该在实例目录里");
+
+    // 同一个号再来一次 → 拒绝
+    let refused = "";
+    try {
+      await inst.createInstance({ name: "重复", accountId: NEW_QQ, copyProtocolDir: false });
+    } catch (error) {
+      refused = String(error?.message ?? error);
+    }
+    assert(/已经有一个实例|就是当前这个实例/.test(refused), `重复账号必须被拒绝，实际：${refused || "没拒绝"}`);
+
+    // 当前实例正在用的号也要被拒绝
+    let refused2 = "";
+    try {
+      await inst.createInstance({ name: "抢当前号", accountId: String(getConfig().bot.selfId), copyProtocolDir: false });
+    } catch (error) {
+      refused2 = String(error?.message ?? error);
+    }
+    assert(refused2, "当前正在用的号不能拿去开新实例");
+
+    const list = await inst.listInstances();
+    assert(list.some((item) => item.dir === dir), "列表里应该能看到刚建的实例");
+    assert(list.some((item) => item.current), "列表里要有一个标记为当前的实例");
+
+    await inst.deleteInstance(created.id, { deleteFiles: true });
+    assert(!fsMod.existsSync(dir), "带 deleteFiles 时目录应该被删掉");
+    assert(!(await inst.listInstances()).some((item) => item.dir === dir), "删完列表里不该再有它");
+    saveConfig({ bot: before.bot });
+    return `新建端口 ${created.panelPort}/${created.wsPort}/${created.httpPort}；重复账号被拒；删除干净`;
+  });
+
+  await test("FR-931", "多实例：--instance 会在加载任何模块前把目录摆好", async () => {
+    const bundled = Boolean(process.getBuiltinModule?.("node:sea")?.isSea?.());
+    // 打包成单文件后没有 lib/ 目录可以给探针 import，这个用例只能在源码环境跑。
+    // 跳过而不是失败：机制本身在源码态被完整验证过，打包版沿用同一份代码。
+    if (bundled) return "打包环境跳过（没有源码目录可写探针）";
+    const fsMod = await import("node:fs");
+    const { spawnSync } = await import("node:child_process");
+    const probe = path.join(TMP, "instprobe.mjs");
+    const target = path.join(TMP, "fake-instance");
+    fsMod.mkdirSync(target, { recursive: true });
+    // 用绝对 file:// 地址，免得 ESM 按「探针文件所在目录」去解析相对路径
+    const bootUrl = new URL("../lib/boot-env.mjs", import.meta.url).href;
+    const pathsUrl = new URL("../lib/paths.mjs", import.meta.url).href;
+    fsMod.writeFileSync(probe, [
+      `import ${JSON.stringify(bootUrl)};`,
+      `import { paths } from ${JSON.stringify(pathsUrl)};`,
+      "console.log(JSON.stringify({ app: paths.app, settings: paths.settings, data: paths.data }));",
+    ].join("\n"), "utf8");
+    // 子进程要模拟「用户直接双击启动」：把自检自己的环境变量摘掉，
+    // 否则 HEARTECHO_DATA_DIR 会盖过实例自己的设置，测出来的就不是真实行为
+    const env = { ...process.env };
+    for (const key of ["HEARTECHO_DATA_DIR", "HEARTECHO_LOG_DIR", "HEARTECHO_SETTINGS", "HEARTECHO_APP_DIR", "HEARTECHO_INSTANCES_HOME", "HEARTECHO_LOG_LEVEL"]) {
+      delete env[key];
+    }
+    const out = spawnSync(process.execPath, [probe, "--instance", target], { encoding: "utf8", env });
+    assert(out.status === 0, `子进程失败：${out.error?.message || out.stderr || out.stdout}`);
+    const got = JSON.parse(String(out.stdout).trim().split("\n").pop());
+    eq(path.resolve(got.app), path.resolve(target), "程序目录应该等于实例目录");
+    eq(path.resolve(got.settings), path.join(path.resolve(target), "心语设置.json"), "设置文件应该在实例目录下");
+    assert(path.resolve(got.data).startsWith(path.resolve(target)), "数据目录也要落在实例里");
+    return `--instance 生效：${got.app}`;
+  });
+
+  await test("FR-932", "同一个 QQ 号：占位文件能挡住第二个实例，崩溃留下的死占位不会挡路", async () => {
+    const inst = await import("../lib/instances.mjs");
+    const fsMod = await import("node:fs");
+    const QQ = "10000093";
+    const claimFile = inst.accountClaimPath(QQ);
+    fsMod.rmSync(claimFile, { force: true });
+    eq(await inst.findAccountHolder(QQ), null, "一开始不该有占位");
+
+    // 模拟「另一个进程」占着这个号：pid 用父进程（保证是活着的），目录指向别处
+    fsMod.mkdirSync(path.dirname(claimFile), { recursive: true });
+    fsMod.writeFileSync(claimFile, JSON.stringify({ pid: process.ppid, dir: "C:/fake/inst-b", dataDir: "C:/fake/inst-b/data", panelPort: 5401, startedAt: Date.now() }), "utf8");
+    const holder = await inst.findAccountHolder(QQ);
+    assert(holder && holder.panelPort === 5401, `别的进程占着时应该查得到，实际：${JSON.stringify(holder)}`);
+    // 同一个目录自己占自己（重启）不算冲突
+    eq(await inst.findAccountHolder(QQ, { excludeDir: "C:/fake/inst-b" }), null, "同一个目录不算冲突");
+    // 想去别的目录抢这个号 → 被挡住
+    eq(inst.claimAccount(QQ, { dir: "C:/fake/inst-c", dataDir: "C:/fake/inst-c/data", panelPort: 5402 }).ok, false, "同一个号不能被第二个进程占");
+
+    // 那个进程退出（占位被删）之后，本进程可以正常占、也能正常释放
+    fsMod.rmSync(claimFile, { force: true });
+    eq(inst.claimAccount(QQ, { dir: "C:/fake/inst-a", dataDir: "C:/fake/inst-a/data", panelPort: 5403 }).ok, true, "没人占时应该能占住");
+    assert((await inst.findAccountHolder(QQ))?.panelPort === 5403, "占住之后应该查得到");
+    eq(inst.releaseAccountClaim(QQ).ok, true, "自己的占位应该能释放");
+    eq(await inst.findAccountHolder(QQ), null, "释放后不该再占着");
+
+    // 模拟崩溃：进程已经不在了，占位还留着 —— 不能永远挡住用户
+    fsMod.writeFileSync(claimFile, JSON.stringify({ pid: 999999, dir: "C:/fake/dead", panelPort: 1, startedAt: Date.now() }), "utf8");
+    eq(await inst.findAccountHolder(QQ), null, "进程已经不在的占位要当成没有");
+    // 太旧的占位（防止 pid 复用）也当作没有
+    fsMod.writeFileSync(claimFile, JSON.stringify({ pid: process.ppid, dir: "C:/fake/old", panelPort: 2, startedAt: Date.now() - 8 * 86400000 }), "utf8");
+    eq(await inst.findAccountHolder(QQ), null, "超过 7 天的占位要当成没有");
+    fsMod.rmSync(claimFile, { force: true });
+    return "别的进程占着能挡住 / 同目录放行 / 释放可复用 / 死占位与过期占位自动忽略";
   });
 
   await test("FR-914", "断线/重启期间漏掉的消息能补回来（并且重复补不会写两遍）", async () => {

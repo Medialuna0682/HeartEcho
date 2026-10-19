@@ -40,6 +40,9 @@ docs/
 # ⑥ 开发依赖与杂项
 # ---------------------------------------------------------------
 node_modules/
+# 多实例的登记表和每个实例的目录（里面有自己的 config.json 和 API Key）
+instances/
+instances.json
 *.log
 *.tmp
 .DS_Store
@@ -47,3 +50,4 @@ Thumbs.db
 desktop.ini
 .vscode/
 .idea/
+

@@ -14,7 +14,11 @@
  *   node index.mjs --greet-now [QQ]    立刻主动发一条消息
  *   node index.mjs --test-image <图>   图片识别自检（不发到 QQ）
  *   node index.mjs --selftest          跑离线自检（等价于 tools/selftest.mjs）
+ *   node index.mjs --instance <目录>   运行 instances/<目录> 里的那份实例（多账号）
  */
+// ⚠ 必须是第一个 import：它只解析 --instance 并把环境变量摆好，
+// 而 paths.mjs 在加载时就把目录算死了，晚一步就来不及。
+import "./lib/boot-env.mjs";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -365,6 +369,42 @@ async function main() {
   }
   if (lock.warning) log.warn(`单实例锁没写成功（不影响使用）：${lock.warning}`);
 
+  /* -------------------- 同一个 QQ 号只能有一个实例在跑 -------------------- */
+
+  /*
+   * 锁只管「同一个数据目录」，管不了「两个目录用同一个 QQ 号」。
+   * 两个实例同时登录同一个号，会互相抢消息、互相顶下线，
+   * 表现出来就是「她一会儿回一会儿不回」。所以这里再拦一道。
+   *
+   * 判断方式是去打对方的面板（比 pid 靠谱，还能顺便知道它在跑什么）。
+   * 只看登记过的实例：手动复制出来的目录不在登记表里，这里看不到——
+   * 那种情况留给 QQ 自己的顶号行为去暴露，错误信息里也会提示。
+   */
+  try {
+    const { findAccountHolder, claimAccount } = await import("./lib/instances.mjs");
+    const holder = await findAccountHolder(bootCfg.bot.selfId, { excludeDir: paths.app, excludeDataDir: paths.data });
+    if (holder) {
+      const where = holder.panelPort ? `（面板端口 ${holder.panelPort}）` : "";
+      const message = `QQ ${bootCfg.bot.selfId} 已经在另一个实例「${holder.name}」${where}里跑着了。\n同一个账号只能开一个实例：同时登录会被互相顶下线，消息也会串。\n要同时聊两个角色，请给另一个角色配另一个 QQ 号（面板「QQ 账号 → 新增实例」）。`;
+      log.error(message);
+      console.error(message);
+      closeDb();
+      process.exitCode = 1;
+      return;
+    }
+    // 占住这个号：别的实例（哪怕目录是手动复制的）启动时就能看见
+    const claimed = claimAccount(bootCfg.bot.selfId, { dir: paths.app, dataDir: paths.data, panelPort: bootPort });
+    if (!claimed.ok) {
+      log.error(claimed.reason);
+      console.error(claimed.reason);
+      closeDb();
+      process.exitCode = 1;
+      return;
+    }
+  } catch (error) {
+    log.warn(`检查账号占用失败（不影响启动）：${error?.message ?? error}`);
+  }
+
   /* ---------------------- 开机自启：只在打包版自动登记 ---------------------- */
 
   // 只在「真正的安装位置」第一次运行时自动打开，避免测试沙箱把用户的启动项写脏
@@ -622,6 +662,13 @@ async function main() {
       backup("on-exit");
       closeDb();
       releaseLock();
+      // 把「这个 QQ 号被我占着」的占位删掉，否则别的实例永远起不来
+      try {
+        const { releaseAccountClaim } = await import("./lib/instances.mjs");
+        releaseAccountClaim(bootCfg.bot.selfId);
+      } catch (error) {
+        log.debug(`释放账号占位失败（占位里的进程已退出，会被下次启动自动忽略）：${error?.message ?? error}`);
+      }
     } catch (error) {
       log.warn(`退出时出错：${error?.message ?? error}`);
     }
