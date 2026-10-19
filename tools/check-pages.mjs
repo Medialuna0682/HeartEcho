@@ -29,7 +29,7 @@ const profile = path.join(os.tmpdir(), `heartecho-pages-${Date.now().toString(36
 const child = spawn(
   binary,
   ["--headless=new", "--disable-gpu", "--hide-scrollbars", "--no-first-run", `--user-data-dir=${profile}`, `--remote-debugging-port=${PORT}`, "--window-size=1440,980", "about:blank"],
-  { stdio: "ignore" },
+  { stdio: "ignore", windowsHide: true },
 );
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -96,7 +96,9 @@ async function main() {
   await send("Runtime.enable");
   await send("Page.enable");
   await send("Emulation.setDeviceMetricsOverride", { width: 1440, height: 980, deviceScaleFactor: 1, mobile: false });
-  await send("Page.navigate", { url: BASE + "/" });
+  const launch = new URL(BASE);
+  if (process.env.HEARTECHO_PANEL_TOKEN) launch.hash = `panelToken=${process.env.HEARTECHO_PANEL_TOKEN}`;
+  await send("Page.navigate", { url: launch.href });
   await sleep(5000);
 
   const rows = [];

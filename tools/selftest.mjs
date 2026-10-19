@@ -657,9 +657,11 @@ async function main() {
       worldview: "2077 年的沿海城市，AI 与人类混住，天气预报由城市系统播报。",
       persona: "住在港区的看护型驱逐舰少女。",
       speechStyle: "说话轻轻的。",
+      userOwnerId: String(MASTER),
+      userAccountId: String(SELF),
       user: { name: "阿岚", occupation: "程序员", city: "武汉", likes: "热汤面", dislikes: "香菜", taboos: "别提他的前任" },
     };
-    const prompt = llmMod.buildSystemPrompt(character, { masterName: "指挥官", relationship: "你在和他私聊。", style: configMod.replyStyle() });
+    const prompt = llmMod.buildSystemPrompt(character, { audience: { kind: "private", peerId: String(MASTER), accountId: String(SELF), scopeKey: `private_${MASTER}` }, masterName: "指挥官", relationship: "你在和他私聊。", style: configMod.replyStyle() });
     assert(prompt.includes("2077 年的沿海城市"), "世界观应该进提示词");
     assert(prompt.includes("阿岚") && prompt.includes("程序员") && prompt.includes("武汉"), "「关于你」的字段应该都进提示词");
     assert(prompt.includes("别提他的前任"), "雷区必须进提示词");
