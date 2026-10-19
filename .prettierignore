@@ -1,0 +1,14 @@
+# Runtime data, third-party protocol and generated outputs
+data/
+protocol/
+build/
+dist/
+docs/
+node_modules/
+package-lock.json
+心语设置.json
+LICENSE
+NOTICE
+# These launchers use GBK/CRLF and must not be rewritten.
+*.bat
+*.cmd

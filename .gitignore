@@ -40,7 +40,6 @@ docs/
 # ⑥ 开发依赖与杂项
 # ---------------------------------------------------------------
 node_modules/
-package-lock.json
 *.log
 *.tmp
 .DS_Store
