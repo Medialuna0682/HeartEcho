@@ -1090,6 +1090,121 @@ async function main() {
     return `第 1/2/3/4 轮带文件数：${seen.map((item) => item.length).join(" / ")}`;
   });
 
+  await test("FR-926", "参数类错误不会被误判成「模型下线」，自动换模型也不改用户的选择", async () => {
+    const cases = [
+      ['{"error":{"message":"invalid temperature: only 1 is allowed for this model"}}', false],
+      ['{"error":{"message":"max_tokens is too large for this model"}}', false],
+      ['{"error":{"message":"context length exceeded"}}', false],
+      ['{"error":{"message":"rate limit exceeded"}}', false],
+      ['{"error":{"message":"insufficient balance"}}', false],
+      ['{"error":{"message":"permission denied"}}', false],
+      ['{"error":{"message":"Not found the model kimi-k2.6 or Permission denied"}}', true],
+      ['{"error":{"message":"The model xxx does not exist"}}', true],
+      ['{"error":{"message":"模型不存在"}}', true],
+    ];
+    for (const [text, want] of cases) {
+      eq(llmMod.LlmGateway.isModelError(text), want, `判错了：${text}`);
+    }
+
+    // 自动挑模型不能写回配置——否则用户第二天开机会发现模型被换回默认值
+    const before = getConfig();
+    const id = before.llm.activeProfile;
+    const originalModel = before.llm.profiles[id].model;
+    const gw = new llmMod.LlmGateway();
+    gw.listModels = async () => ({ ok: true, ids: ["repo-model", "另一个模型"], models: [], message: "ok" });
+    const picked = await gw.ensureUsableModel({ profileId: id, badModel: "用不了的那个" });
+    assert(picked.ok && picked.model, "应该挑出一个可用的模型");
+    eq(getConfig().llm.profiles[id].model, originalModel, "自动挑出来的模型不该写进配置");
+    eq(picked.persisted, false, "默认不该持久化");
+    return `${cases.length} 种报文判定正确；自动挑了「${picked.model}」但配置仍是「${originalModel}」`;
+  });
+
+  await test("FR-927", "日志接口真的有内容，前端也会把历史日志画出来", async () => {
+    const logMod = await import("../lib/log.mjs");
+    const logger = logMod.createLogger("Selftest");
+    // 自检以 warn 级别运行，所以这里用 warn（用 info 会被级别过滤掉）
+    logger.warn("自检写入的一条日志");
+    await new Promise((r) => setTimeout(r, 10));
+    const recent = logMod.recentLogs(50);
+    assert(recent.length > 0, "环形缓冲里应该有日志");
+    assert(recent.some((e) => /自检写入的一条日志/.test(e.message)), "刚写的那条应该在里面");
+    // 前端必须真的把拉回来的历史塞进缓冲区（以前只用到了 level 字段，内容全丢）
+    const appMod = await import("../lib/ui-app.mjs");
+    const script = appMod.appScript({ iconsJson: "{}" });
+    assert(script.includes("pushLogs(res.logs"), "pageLogs 必须把历史日志塞进缓冲区");
+    assert(script.includes("renderLogs(LOG_BUFFER)"), "进页面时必须立即渲染一次");
+    assert(!script.includes("`"), "前端代码里不能出现反引号（整个脚本本身是模板字符串）");
+    return `缓冲 ${recent.length} 条；前端已接上历史渲染`;
+  });
+
+  await test("FR-928", "同一个长任务不会被连点触发多次（单飞 + 进度）", async () => {
+    const jobsMod = await import("../lib/jobs.mjs");
+    jobsMod.resetJobs();
+    let runs = 0;
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const first = jobsMod.runJob("reflect", "自我反思", async (progress) => {
+      runs += 1;
+      progress("第一步");
+      await gate;
+      progress("第二步");
+      return { summary: "跑完了" };
+    });
+    assert(first.started === true, "第一次应该真的启动");
+    const second = jobsMod.runJob("reflect", "自我反思", async () => { runs += 1; return { summary: "不该发生" }; });
+    eq(second.started, false, "同一类任务在跑时，第二次点击不该启动新任务");
+    eq(second.job.id, first.job.id, "第二次应该拿到同一个任务");
+    release();
+    for (let i = 0; i < 40; i += 1) {
+      await new Promise((r) => setTimeout(r, 25));
+      if (jobsMod.getJob(first.job.id)?.status !== "running") break;
+    }
+    const done = jobsMod.getJob(first.job.id);
+    eq(done.status, "done", "任务应该跑完");
+    eq(runs, 1, "worker 只应该执行一次");
+    assert(done.steps.some((s) => s.message === "第一步") && done.steps.some((s) => s.message === "第二步"), "进度步骤要都记下来");
+    assert(done.steps.some((s) => /跑完了/.test(s.message)), "完成时应该把结果摘要写成最后一步");
+    const third = jobsMod.runJob("reflect", "自我反思", async () => ({ summary: "第二次" }));
+    assert(third.started === true, "上一个跑完后应该可以再启动");
+    jobsMod.resetJobs();
+    return `重复点击只跑 1 次；进度 ${done.steps.length} 步；跑完可再启动`;
+  });
+
+  await test("FR-929", "写日记给的输出额度够大（以前 900 会被思考吃光，正文空）", async () => {
+    // 不能读源码：打包成单文件后根本没有 lib/ 目录。这里直接跑一次写日记，
+    // 把传给模型的参数截下来看——行为测试在源码和 exe 里都成立。
+    const character = loadCharacter(activeCharacterId());
+    const { dayKey } = util;
+    const existing = db.one("select id from memories where scope_key = ? and content like ?", [
+      `diary_${character.id}_${dayKey(new Date())}`,
+      "%[日记 %",
+    ]);
+    if (existing) db.run("delete from memories where id = ?", [existing.id]);
+    memory.addMemory({
+      scopeKey: `private_${MASTER}`,
+      content: "今天他跟我说了很多话，我听着，觉得心里很稳。",
+      category: "episodic",
+      sourceType: "observed",
+      confidence: 0.9,
+      importance: 0.6,
+      characterId: character.id,
+      at: Date.now(),
+    });
+    let captured = null;
+    const stubLlm = {
+      chat: async (messages, options) => {
+        captured = options;
+        return { text: "今天他跟我说了很多话。我把这些话收好了。", usage: { cost: 0 } };
+      },
+    };
+    const result = await life.writeDiary({ llm: stubLlm, character, force: true });
+    assert(captured, "应该真的调用了模型");
+    const tokens = Number(captured.overrides?.maxTokens ?? 0);
+    assert(tokens >= 2048, `日记的 maxTokens 太小（${tokens}），思考型模型会把额度花光导致正文为空`);
+    assert(result.skipped === false && result.text, `日记应该写出来，实际：${result.reason || ""}`);
+    return `maxTokens = ${tokens}，写出 ${result.text.length} 字`;
+  });
+
   await test("FR-914", "断线/重启期间漏掉的消息能补回来（并且重复补不会写两遍）", async () => {
     const scope = `private_${MASTER}`;
     db.run("delete from messages where scope_key = ?", [scope]);
@@ -1124,7 +1239,11 @@ async function main() {
       ['{"error":{"message":"Not found the model moonshot-v1-8k or Permission denied","type":"resource_not_found_error"}}', true],
       ["The model `gpt-5` does not exist or you do not have access to it.", true],
       ["invalid model name: claude-x", true],
-      ['{"error":{"message":"invalid temperature: only 1 is allowed for this model"}}', true],
+      // 这条以前被写成 true，正是那次「模型被悄悄换掉」的根源：
+      // temperature 参数错误和「模型下线」是两回事，混在一起就会每次 json 调用都换模型
+      ['{"error":{"message":"invalid temperature: only 1 is allowed for this model"}}', false],
+      ['{"error":{"message":"max_tokens is too large for this model"}}', false],
+      ['{"error":{"message":"insufficient balance"}}', false],
       ["HTTP 500: upstream timeout", false],
       ["fetch failed ECONNRESET", false],
       ['{"error":{"message":"Incorrect API key provided"}}', false],
@@ -1133,7 +1252,7 @@ async function main() {
       const actual = llmMod.LlmGateway.isModelError(text);
       assert(actual === expected, `「${text.slice(0, 50)}」应该判定为 ${expected}，实际 ${actual}`);
     }
-    return "6 个样本全部判对";
+    return `${cases.length} 个样本全部判对`;
   });
 
   await test("FR-916", "自动挑模型时优先选通用对话模型，避开 code/vision 专用", async () => {
