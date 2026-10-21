@@ -1176,7 +1176,7 @@ async function main() {
     return `重复点击只跑 1 次；进度 ${done.steps.length} 步；跑完可再启动`;
   });
 
-  await test("FR-929", "写日记给的输出额度够大（以前 900 会被思考吃光，正文空）", async () => {
+  await test("FR-929", "写日记给的输出额度够大，而且真的落库（以前额度被思考吃光 / 存不进去还报成功）", async () => {
     // 不能读源码：打包成单文件后根本没有 lib/ 目录。这里直接跑一次写日记，
     // 把传给模型的参数截下来看——行为测试在源码和 exe 里都成立。
     const character = loadCharacter(activeCharacterId());
@@ -1208,7 +1208,82 @@ async function main() {
     const tokens = Number(captured.overrides?.maxTokens ?? 0);
     assert(tokens >= 2048, `日记的 maxTokens 太小（${tokens}），思考型模型会把额度花光导致正文为空`);
     assert(result.skipped === false && result.text, `日记应该写出来，实际：${result.reason || ""}`);
-    return `maxTokens = ${tokens}，写出 ${result.text.length} 字`;
+    /*
+     * 关键的一条：以前这里只核对了「返回 skipped:false」，于是 addMemory 悄悄没存进去
+     * （日记被当成 simulated，被「虚构日常没开启」挡住）也照样通过——
+     * 自检绿着，用户那边日记栏一辈子是空的。所以要回到库里看。
+     */
+    assert(result.memoryId, `日记应该有一个真实的记忆 id，实际：${JSON.stringify(result.memoryId)}`);
+    const row = db.one("select * from memories where id = ?", [result.memoryId]);
+    assert(row, "日记应该真的写进了 memories 表");
+    eq(row.category, "diary", "日记的 category 必须是 diary（混进 episodic 会出现在经历时间线里）");
+    eq(row.source_type, "diary", "日记的 source_type 必须是 diary（用 simulated 会被虚构日常开关挡住）");
+    assert(String(row.content).startsWith("[日记 "), "日记正文要带 [日记 日期] 前缀，否则列表认不出来");
+    return `maxTokens = ${tokens}，写出 ${result.text.length} 字并落库（#${row.id}）`;
+  });
+
+  await test("FR-933", "日记写完后面板看得见，而且不会混进经历时间线、也不会被对话检索命中", async () => {
+    const character = loadCharacter(activeCharacterId());
+    const cfg = getConfig();
+    const simulatedBefore = cfg.life?.simulated?.enabled === true;
+    saveConfig({ life: { simulated: { enabled: false } } });
+    let written = null;
+    try {
+      // 故意写在这个私聊作用域里：这样「能不能被检索到」才是真问题
+      const secret = "日记里的私人记录：今天他把伞留给了我。";
+      written = await life.writeDiary({
+        llm: { chat: async () => ({ text: secret, usage: { cost: 0 } }) },
+        character,
+        scopeKey: `private_${MASTER}`,
+        force: true,
+      });
+      assert(written.memoryId, `日记应该写进去，实际：${written.reason || JSON.stringify(written)}`);
+
+      const snapshot = life.lifeSnapshot({ characterId: character.id, masterId: MASTER, masterName: "指挥官" });
+      const today = util.dayKey(new Date());
+      assert(
+        (snapshot.diary || []).some((row) => row.date === today),
+        `面板的日记列表里应该有今天这一篇，实际：${(snapshot.diary || []).map((r) => r.date).join(",") || "空"}`,
+      );
+      assert(snapshot.diaryTotal >= 2, `日记总数应该 ≥ 2，实际 ${snapshot.diaryTotal}`);
+      const inTimeline = (snapshot.experienceDays || []).some((day) =>
+        day.items.some((item) => String(item.category) === "diary" || String(item.content).startsWith("[日记 ")),
+      );
+      assert(!inTimeline, "日记不该出现在经历时间线里");
+      // 也不能被当成对话记忆检索出来（检索块里冒出「[日记 2026-…]」前缀，她在聊天里就会带上日记腔）
+      const recalled = memory.retrieveMemories({ scopeKey: `private_${MASTER}`, query: "日记里的私人记录", limit: 30 });
+      assert(!recalled.some((item) => String(item.content).startsWith("[日记 ")), "日记不该被对话记忆检索命中");
+      return `日记 ${snapshot.diary.length} 篇（共 ${snapshot.diaryTotal}）；时间线与检索都干净`;
+    } finally {
+      saveConfig({ life: { simulated: { enabled: simulatedBefore } } });
+      if (written?.memoryId) db.run("delete from memories where id = ?", [written.memoryId]);
+    }
+  });
+
+  await test("FR-934", "经历时间线按天分组：同一天归一条、最新的在前、条数对得上", async () => {
+    const day1 = Date.parse("2026-01-02T10:00:00+08:00");
+    const day2 = Date.parse("2026-01-03T09:30:00+08:00");
+    const made = [
+      { at: day1, text: "一月二日的第一件事" },
+      { at: day1 + 3600000, text: "一月二日的第二件事" },
+      { at: day2, text: "一月三日的一件事" },
+    ];
+    const groups = life.groupExperiencesByDay(made);
+    eq(groups.length, 2, "两天应该分成两组");
+    eq(groups[0].date, "2026-01-03", "最新的日期要排在最前面");
+    eq(groups[0].count, 1, "第三天只有 1 条");
+    eq(groups[1].date, "2026-01-02", "更早的日期排在后面");
+    eq(groups[1].count, 2, "同一天的两条要归到一起");
+    eq(groups[1].items.length, 2, "items 和 count 要对得上");
+
+    // 再走一遍真的快照：库里那条「今天」的经历要出现在今天的抽屉里
+    const character = loadCharacter(activeCharacterId());
+    const snapshot = life.lifeSnapshot({ characterId: character.id, masterId: MASTER, masterName: "指挥官" });
+    const today = util.dayKey(new Date());
+    const todayGroup = (snapshot.experienceDays || []).find((day) => day.date === today);
+    assert(todayGroup && todayGroup.items.length >= 1, "今天的经历应该出现在今天的抽屉里");
+    assert(snapshot.experienceTotal >= todayGroup.items.length, "经历总数不能小于一天的条数");
+    return `2 天 → ${groups.map((g) => `${g.date}(${g.count})`).join(" ")}；今天 ${todayGroup.items.length} 条`;
   });
 
   await test("FR-930", "多实例：一个账号只能一个实例，新实例有独立目录/端口/配置", async () => {
