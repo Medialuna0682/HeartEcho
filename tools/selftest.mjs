@@ -1286,6 +1286,34 @@ async function main() {
     return `2 天 → ${groups.map((g) => `${g.date}(${g.count})`).join(" ")}；今天 ${todayGroup.items.length} 条`;
   });
 
+  await test("FR-935", "同一天重写日记：旧的那篇标成「被取代」，面板上只留一篇", async () => {
+    const character = loadCharacter(activeCharacterId());
+    const first = await life.writeDiary({
+      llm: { chat: async () => ({ text: "第一版：今天写了点东西。", usage: { cost: 0 } }) },
+      character,
+      force: true,
+    });
+    assert(first.memoryId, `第一篇应该写进去，实际：${first.reason || ""}`);
+    const second = await life.writeDiary({
+      llm: { chat: async () => ({ text: "第二版：改了个说法，还是今天的事。", usage: { cost: 0 } }) },
+      character,
+      force: true,
+    });
+    assert(second.memoryId && second.memoryId !== first.memoryId, "重写应该产生新的一篇，而不是覆盖原文");
+    const oldRow = db.one("select * from memories where id = ?", [first.memoryId]);
+    eq(oldRow.status, "superseded", "旧的那篇要标成被取代（原文仍然留着）");
+    eq(Number(oldRow.superseded_by), Number(second.memoryId), "旧的那篇要指向新的那篇");
+    const snapshot = life.lifeSnapshot({ characterId: character.id, masterId: MASTER, masterName: "指挥官" });
+    const today = util.dayKey(new Date());
+    const todays = (snapshot.diary || []).filter((row) => row.date === today && String(row.content).indexOf("第一版") >= 0);
+    eq(todays.length, 0, "被取代的那篇不该再出现在面板上");
+    assert(
+      (snapshot.diary || []).some((row) => String(row.content).indexOf("第二版") >= 0),
+      "新的那篇要出现在面板上",
+    );
+    return `旧 #${first.memoryId} → superseded，新 #${second.memoryId} 生效`;
+  });
+
   await test("FR-930", "多实例：一个账号只能一个实例，新实例有独立目录/端口/配置", async () => {
     const inst = await import("../lib/instances.mjs");
     const fsMod = await import("node:fs");
