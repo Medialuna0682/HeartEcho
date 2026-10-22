@@ -19,7 +19,11 @@ const ARGS = process.argv.slice(2);
 const WITH_LLM = ARGS.includes("--with-llm");
 const KEEP = ARGS.includes("--keep");
 
-const TMP = path.join(os.tmpdir(), `heartecho-selftest-${Date.now().toString(36)}`);
+// 打包版的 `心语.exe --selftest` 会先把临时目录名传给子进程（那边 lib 模块已经加载过，
+// 这里的临时目录必须和它一致，否则多实例/协议端会指向用户真实目录）。
+const TMP = process.env.HEARTECHO_SELFTEST_TMP
+  ? path.resolve(process.env.HEARTECHO_SELFTEST_TMP)
+  : path.join(os.tmpdir(), `heartecho-selftest-${Date.now().toString(36)}`);
 fs.mkdirSync(TMP, { recursive: true });
 
 // 必须在导入任何业务模块之前设定环境变量：paths.mjs 在模块加载时就解析目录
@@ -1398,12 +1402,15 @@ async function main() {
     }
   });
 
-  await test("FR-930", "多实例：一个账号只能一个实例，新实例有独立目录/端口/配置", async () => {
+  await test("FR-930", "多实例：一个账号只能一个实例，新实例有独立目录/端口/配置（协议端共用）", async () => {
     const inst = await import("../lib/instances.mjs");
     const fsMod = await import("node:fs");
     const NEW_QQ = "10000091";
     const before = getConfig();
-    // 别用真端口：自检只验证目录和配置写对了
+    // 多实例共用的协议端目录（主实例那一份）；别用真端口：自检只验证目录和配置写对了
+    const sharedDir = path.join(TMP, "app", "protocol");
+    fsMod.mkdirSync(path.join(sharedDir, "config"), { recursive: true });
+    fsMod.writeFileSync(path.join(sharedDir, "config", "runtime.json"), JSON.stringify({ webuiPort: 5999 }), "utf8");
     const created = await inst.createInstance({ name: "自检实例", accountId: NEW_QQ, masterId: "10000092", masterName: "阿岚", characterId: activeCharacterId(), copyProtocolDir: false });
     assert(created.panelPort && created.wsPort && created.httpPort && created.webuiPort, "三个端口都要分到");
     eq(new Set([created.panelPort, created.wsPort, created.httpPort]).size, 3, "端口不能互相重复");
@@ -1415,10 +1422,18 @@ async function main() {
     eq(Number(seed.bot.panelPort), created.panelPort, "面板端口要写进去");
     assert(seed.bot.onebotWsUrl.includes(String(created.wsPort)), "OneBot 地址要用自己的端口");
     assert(fsMod.existsSync(path.join(dir, "data", "characters", activeCharacterId() + ".json")), "角色卡应该复制过去");
-    // 设置文件必须指向实例自己的 data / protocol，否则会和主实例抢
+    // 设置文件：数据指向实例自己；协议端指向多实例共用的那一份（不能各跑一份，会互相抢 QQ 钩子）
     const settings = JSON.parse(fsMod.readFileSync(path.join(dir, "心语设置.json"), "utf8"));
     eq(settings.dataDir, "data", "dataDir 应该是相对路径，指向实例自己");
-    eq(settings.snowlumaDir, "protocol", "协议端也应该在实例目录里");
+    eq(path.resolve(settings.snowlumaDir), sharedDir, "协议端要指向多实例共用的那一份");
+    eq(created.protocolShared, true, "新实例应该直接复用共用协议端");
+    eq(Number(created.webuiPort), 5999, "WebUI 端口应该用共用协议端的那一个");
+    assert(!fsMod.existsSync(path.join(dir, "protocol")), "实例目录里不该再复制一份协议端");
+    const sharedAccountFile = path.join(sharedDir, "config", `onebot_${NEW_QQ}.json`);
+    assert(fsMod.existsSync(sharedAccountFile), "新号的端口/令牌要写进共用协议端的 config");
+    const sharedAccount = JSON.parse(fsMod.readFileSync(sharedAccountFile, "utf8"));
+    eq(Number(sharedAccount.networks.wsServers[0].port), created.wsPort, "共用配置里要写这个号自己的 WebSocket 端口");
+    eq(sharedAccount.networks.wsServers[0].accessToken, seed.bot.accessToken, "共用配置里的令牌要和实例一致");
 
     // 同一个号再来一次 → 拒绝
     let refused = "";
@@ -1445,8 +1460,9 @@ async function main() {
     await inst.deleteInstance(created.id, { deleteFiles: true });
     assert(!fsMod.existsSync(dir), "带 deleteFiles 时目录应该被删掉");
     assert(!(await inst.listInstances()).some((item) => item.dir === dir), "删完列表里不该再有它");
+    fsMod.rmSync(sharedAccountFile, { force: true });
     saveConfig({ bot: before.bot });
-    return `新建端口 ${created.panelPort}/${created.wsPort}/${created.httpPort}；重复账号被拒；删除干净`;
+    return `新建端口 ${created.panelPort}/${created.wsPort}/${created.httpPort}；账号配置写进共用协议端；重复账号被拒；删除干净`;
   });
 
   await test("FR-931", "多实例：--instance 会在加载任何模块前把目录摆好", async () => {

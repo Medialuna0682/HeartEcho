@@ -266,7 +266,17 @@ async function main() {
       const child = spawnSync(process.execPath, [...process.execArgv, ...process.argv.slice(1)], {
         cwd: process.cwd(),
         stdio: "inherit",
-        env: { ...process.env, HEARTECHO_DATA_DIR: tempData, HEARTECHO_LOG_DIR: path.join(tempData, "logs") },
+        // 多实例的登记表 / 共用协议端 / 账号占位也必须指到临时目录：
+        // 打包后的自检会在「真实程序目录」里把 lib 模块先加载一遍，
+        // 这些环境变量必须在子进程启动前就设好，否则自检会碰到用户真实的协议端配置。
+        env: {
+          ...process.env,
+          HEARTECHO_DATA_DIR: tempData,
+          HEARTECHO_LOG_DIR: path.join(tempData, "logs"),
+          HEARTECHO_SELFTEST_TMP: tempData,
+          HEARTECHO_INSTANCES_HOME: path.join(tempData, "app"),
+          HEARTECHO_CLAIM_DIR: path.join(tempData, "claims"),
+        },
       });
       try {
         fs.rmSync(tempData, { recursive: true, force: true });
