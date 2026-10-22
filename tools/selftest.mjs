@@ -1314,6 +1314,90 @@ async function main() {
     return `旧 #${first.memoryId} → superseded，新 #${second.memoryId} 生效`;
   });
 
+  await test("FR-936", "拼给模型的历史里不会再出现「正在回的那句」（以前她会说你一句话说了两遍）", async () => {
+    const { ChatEngine } = await import("../lib/chat.mjs");
+    const { LlmGateway } = await import("../lib/llm.mjs");
+    const character = loadCharacter(activeCharacterId());
+    const scope = `private_${STRANGER}`;
+    const engine = new ChatEngine({ client: { selfId: SELF }, llm: {}, scheduler: {} });
+    const key = (n) => `dup:${scope}:${n}`;
+    storage.insertMessage({ eventKey: key(1), scopeKey: scope, direction: "in", senderId: String(STRANGER), at: 1_000_000, body: "第一句" });
+    storage.insertMessage({ eventKey: key(2), scopeKey: scope, direction: "out", senderId: String(SELF), at: 1_000_100, body: "她回的第一句" });
+    // 真实流程是「先落库、再生成」：这条在拼上下文时已经在库里了
+    storage.insertMessage({ eventKey: key(3), scopeKey: scope, direction: "in", senderId: String(STRANGER), at: 1_000_200, body: "正在回的这一句" });
+
+    const event = {
+      eventId: key(3), scopeKey: scope, kind: "private", senderId: String(STRANGER), senderName: "某人",
+      accountId: String(SELF), text: "正在回的这一句", timestampMs: 1_000_200, segments: [],
+    };
+    const ctx = engine.buildContext({ event, character });
+    eq(ctx.userText, "正在回的这一句", "当前这句要作为最后一条 user 消息给出去");
+    assert(!ctx.history.some((row) => row.content === "正在回的这一句"), `历史里不该再出现当前这句，实际历史：${JSON.stringify(ctx.history.map((r) => r.content))}`);
+    assert(ctx.history.some((row) => row.content === "第一句"), "之前的对话不能被一起排掉");
+    assert(ctx.history.some((row) => row.content === "她回的第一句"), "她自己说过的话也要留着");
+
+    // 真的走一遍 speak：最后两条不能是同一句
+    let sent = null;
+    const gateway = new LlmGateway({ budgetGate: { reserve: () => ({ ok: true, reservationId: "fake" }), settle() {}, release() {} } });
+    gateway.chat = async (messages) => {
+      sent = messages;
+      return { text: "好", usage: { cost: 0 } };
+    };
+    await gateway.speak(character, ctx.userText, { history: ctx.history, scopeKey: scope, skipBudget: true });
+    const tails = sent.slice(-2).map((m) => `${m.role}:${m.content}`);
+    assert(tails.length === 2 && tails[0] !== tails[1], `最后两条消息不该一样，实际：${JSON.stringify(tails)}`);
+    eq(sent[sent.length - 1].content, "正在回的这一句", "最后一条是用户这一句");
+
+    // 连发几条被合并时：历史里不能是「逐条一遍 + 合并版一遍」
+    storage.insertMessage({ eventKey: key(4), scopeKey: scope, direction: "in", senderId: String(STRANGER), at: 1_000_300, body: "连发一" });
+    storage.insertMessage({ eventKey: key(5), scopeKey: scope, direction: "in", senderId: String(STRANGER), at: 1_000_400, body: "连发二" });
+    const mergedEvent = {
+      ...event,
+      eventId: key(5),
+      mergedEventIds: [key(4), key(5)],
+      mergedMessages: [
+        { senderId: String(STRANGER), senderName: "某人", text: "连发一", at: 1_000_300 },
+        { senderId: String(STRANGER), senderName: "某人", text: "连发二", at: 1_000_400 },
+      ],
+      text: "连发一\n连发二",
+      timestampMs: 1_000_400,
+    };
+    const mergedCtx = engine.buildContext({ event: mergedEvent, character });
+    assert(!mergedCtx.history.some((row) => String(row.content).includes("连发")), `合并时历史里不该再出现这几条，实际：${JSON.stringify(mergedCtx.history.map((r) => r.content))}`);
+    assert(mergedCtx.userText.includes("连发一") && mergedCtx.userText.includes("连发二"), "合并后的那句要完整给出去");
+
+    for (let n = 1; n <= 5; n += 1) db.run("delete from messages where event_key = ?", [key(n)]);
+    return `历史 ${ctx.history.length} 条，末尾两条 = ${JSON.stringify(tails)}；合并语境也干净`;
+  });
+
+  await test("FR-937", "日记会作为单独一段【你最近写下的日记】进提示词（群里不给、关掉就没有）", async () => {
+    const character = loadCharacter(activeCharacterId());
+    const written = await life.writeDiary({
+      llm: { chat: async () => ({ text: "日记正文：今天他陪我去江边走了很久，风很软。", usage: { cost: 0 } }) },
+      character,
+      force: true,
+    });
+    assert(written.memoryId, `日记应该写进去，实际：${written.reason || ""}`);
+    const injectBefore = getConfig().memory?.injectDiary;
+    try {
+      saveConfig({ memory: { injectDiary: 2 } });
+      const priv = life.promptBlock({ characterId: character.id, scopeKey: `private_${MASTER}`, query: "" }).block;
+      assert(priv.includes("【你最近写下的日记】"), "私聊提示词里应该有日记那一段");
+      assert(priv.includes("今天他陪我去江边走了很久"), "日记正文要能看见");
+      assert(priv.includes("不要逐字复述"), "要明确要求别照着念");
+
+      const group = life.promptBlock({ characterId: character.id, scopeKey: `group_${GROUP_A}_${MASTER}`, query: "" }).block;
+      assert(!group.includes("【你最近写下的日记】"), "群里不该注入她的私人日记");
+
+      saveConfig({ memory: { injectDiary: 0 } });
+      const off = life.promptBlock({ characterId: character.id, scopeKey: `private_${MASTER}`, query: "" }).block;
+      assert(!off.includes("【你最近写下的日记】"), "injectDiary=0 时应该完全不注入");
+      return "私聊可见、群聊不给、关掉就没有";
+    } finally {
+      saveConfig({ memory: { injectDiary: injectBefore ?? 2 } });
+    }
+  });
+
   await test("FR-930", "多实例：一个账号只能一个实例，新实例有独立目录/端口/配置", async () => {
     const inst = await import("../lib/instances.mjs");
     const fsMod = await import("node:fs");
