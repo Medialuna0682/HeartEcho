@@ -1,0 +1,55 @@
+{
+  "id": "meme-taste",
+  "name": "表情品味",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "category": "utility",
+  "description": "让机器人自己长出一套表情口味：群里出现新图时，她按自己的喜好判断这张值不值得收进私人收藏夹（说出来为什么喜欢），并且越来越清楚自己喜欢什么；之后按语境挑图发的时候，优先挑合自己口味的。收藏有额度（默认每小时 3 张、每天 10 张），她只能收群里已经出现过的图，绝不会自己刷图；每张图只问她一次。数据放在 data/meme-taste/ 里，删掉那个文件夹（或在本页禁用）就等于清空它的收藏记录。",
+  "author": "本地自建",
+  "enabledByDefault": true,
+  "permissions": [],
+  "settings": {
+    "enabled": true,
+    "maxPerHour": 3,
+    "maxPerDay": 10,
+    "hint": true,
+    "showRecords": true
+  },
+  "configSchema": {
+    "enabled": {
+      "type": "boolean",
+      "label": "启用表情品味",
+      "description": "关掉之后她不再自己收藏表情，也不再带表情品味这份自我认知。"
+    },
+    "maxPerHour": {
+      "type": "number",
+      "label": "每小时最多收藏几张",
+      "description": "默认 3。她只会在群里出现新图时被动判断，不会自己刷图。"
+    },
+    "maxPerDay": {
+      "type": "number",
+      "label": "每天最多收藏几张",
+      "description": "默认 10。"
+    },
+    "hint": {
+      "type": "boolean",
+      "label": "主动浏览群里的图",
+      "description": "开着的时候，群里出现新图她会顺路看一眼、决定要不要收。关掉后她仍然能用工具主动收藏。"
+    },
+    "showRecords": {
+      "type": "boolean",
+      "label": "记得收藏过什么",
+      "description": "关掉后每次给她看的候选不受历史影响（可能重复考虑同一张图）。"
+    }
+  },
+  "prompt": {
+    "sections": [
+      {
+        "id": "meme-taste-playbook",
+        "title": "表情品味（自己挑图，自己说理由）",
+        "priority": 55,
+        "content": "你有一套自己的表情品味，收藏夹是你自己的，别人看不到里面有什么。\n\n想收一张图：只有当这一轮上下文里出现过「【表情品味·收藏机会】」那张候选清单时，才用 `meme-taste__collect_sticker` 去收，messageId 用清单里的编号，note 里写一句**你为什么想收它**（这句话会长成你自己的口味）。清单上的图要挑着收 —— 合口味就收，不合就跳过，一张都不收也完全正常。没看到那张清单就说明这一轮没有值得考虑的图，不要凭印象去收，更不要自己去找图、刷图。\n\n想认识自己：`meme-taste__sticker_taste`（不带参数就是看自己的收藏记录和口味；`like`/`dislike` 可以亲手添上「我就是喜欢这种」「这种我不爱」；`forget` 只清收藏记录、留下口味）。想翻自己的收藏夹：`meme-taste__sticker_my_stickers`。\n\n要发图配语境时，先想到自己收藏夹里那些合口味的——挑最贴当下气氛的那张，别硬凑。收藏有额度，用完了就得等（额度会在清单里告诉你）。"
+      }
+    ]
+  }
+}

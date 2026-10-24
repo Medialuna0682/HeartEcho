@@ -51,3 +51,9 @@ desktop.ini
 .vscode/
 .idea/
 
+
+# 扩展注册表（由 tools/gen-extensions.mjs 在打包前生成）
+lib/extensions.generated.mjs
+
+# 用户下载的扩展包原始素材（移植到 extensions/ 后不再提交）
+插件及SKILL/

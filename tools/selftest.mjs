@@ -1886,6 +1886,252 @@ async function main() {
     });
   }
 
+  /* ------------------------------ 插件 / 技能（扩展） ------------------------------ */
+
+  group("插件 / 技能（扩展）");
+
+  const { ExtensionHost, validateExternalUrl } = await import("../lib/extensions.mjs");
+  const { createStickerStore } = await import("../lib/stickers.mjs");
+  const { chatKeyOfScope } = await import("../lib/chat.mjs");
+  const extDataDir = path.join(TMP, "extensions");
+  const extensionHost = new ExtensionHost({ llm, client, dataDir: extDataDir });
+  await extensionHost.init({ setup: true, activate: false });
+
+  await test("EXT-01", "扩展包被发现且清单合法", () => {
+    const status = extensionHost.status();
+    assert(status.counts.plugins >= 6, `插件应至少 6 个，实际 ${status.counts.plugins}`);
+    assert(status.counts.skills >= 8, `技能应至少 8 个，实际 ${status.counts.skills}`);
+    const bad = status.extensions.filter((item) => item.enabled && !item.loaded);
+    assert(bad.length === 0, "已启用的扩展都应能装载：" + bad.map((item) => item.id + ":" + item.error).join("；"));
+    for (const item of status.extensions) assert(item.id && item.name, "每个扩展都要有 id/name");
+    return `插件 ${status.counts.plugins} / 技能 ${status.counts.skills} / 已启用 ${status.counts.enabled}`;
+  });
+
+  await test("EXT-02", "工具名符合 function calling 约束", () => {
+    const defs = extensionHost.toolDefinitions();
+    assert(defs.length >= 20, `工具定义应不少，实际 ${defs.length}`);
+    const names = new Set();
+    for (const def of defs) {
+      const name = def?.function?.name ?? "";
+      assert(/^[a-zA-Z0-9_-]{1,64}$/.test(name), `非法工具名：${name}`);
+      assert(!names.has(name), `工具名重复：${name}`);
+      names.add(name);
+    }
+    return `${defs.length} 个工具，名称全部合法`;
+  });
+
+  await test("EXT-03", "提示词片段按 priority 降序注入且长度受控", () => {
+    const sections = extensionHost.promptSections({ chatKey: "group:123456", chatId: "123456", kind: "group", sessionId: "selftest" });
+    assert(sections.length >= 8, `提示词片段数量偏少：${sections.length}`);
+    for (let i = 1; i < sections.length; i += 1) assert(Number(sections[i - 1].priority) >= Number(sections[i].priority), "priority 必须降序");
+    const total = sections.reduce((sum, item) => sum + item.content.length, 0);
+    assert(total <= 16000, `片段总长度超限：${total}`);
+    const all = sections.map((item) => item.content).join("\n");
+    assert(all.includes("小本本"), "ledger 的提示词片段应该被注入");
+    assert(all.includes("去 AI 味"), "deai-flavor 的提示词片段应该被注入");
+    return `${sections.length} 段 / ${total} 字`;
+  });
+
+  await test("EXT-04", "能力提供者：唤醒策略/接话判定/请求改写", () => {
+    const verdict = extensionHost.wakePolicySync({
+      chatKey: "group:123456",
+      entry: { senderId: "20001", text: "第二句", ts: Date.now() },
+      meta: { senderId: "20001", startedAt: Date.now() - 1000, windowMs: 8000, elapsedMs: 1000 },
+    });
+    assert(verdict && Number(verdict.extendMs) > 0, "同一个人连发时 burst-merge 应该续期");
+    const other = extensionHost.wakePolicySync({
+      chatKey: "group:123456",
+      entry: { senderId: "20002", text: "别人插话", ts: Date.now() },
+      meta: { senderId: "20001", startedAt: Date.now() - 1000, windowMs: 8000, elapsedMs: 1000 },
+    });
+    assert(!other, "别人插话不应续期");
+    for (const name of ["reply.interest-judge", "memory.person-card", "llm.request-params"]) {
+      assert(extensionHost.providers.has(name), `缺少能力提供者：${name}`);
+    }
+    return `续期 ${verdict.extendMs}ms；能力 ${extensionHost.providers.size} 个`;
+  });
+
+  await test("EXT-05", "启停扩展：工具与提示词片段同步切换", async () => {
+    const hasLedgerTool = () => extensionHost.toolDefinitions().some((def) => String(def.function.name).startsWith("ledger__"));
+    assert(hasLedgerTool(), "启用时应有 ledger 工具");
+    await extensionHost.setEnabled("skills", "ledger", false);
+    assert(!hasLedgerTool(), "停用后不应再有 ledger 工具");
+    assert(!extensionHost.promptSections({}).map((item) => item.content).join("\n").includes("小本本"), "停用后不应再注入 ledger 片段");
+    await extensionHost.setEnabled("skills", "ledger", true);
+    assert(hasLedgerTool(), "重新启用后工具应恢复");
+    assert(extensionHost.promptSections({}).map((item) => item.content).join("\n").includes("小本本"), "重新启用后提示词片段应恢复");
+    return "停用/启用后工具与片段都正确切换";
+  });
+
+  await test("EXT-06", "设置校验：数字夹紧与布尔归一", async () => {
+    const result = await extensionHost.updateSettings("plugins", "affinity", { perMessage: -3, announceLevelUp: "false" });
+    assert(result.ok, "保存设置应成功");
+    eq(result.settings.perMessage, 0, "低于 min 的数字应被夹到 0");
+    eq(result.settings.announceLevelUp, false, "字符串 false 应归一成布尔 false");
+    const restore = await extensionHost.updateSettings("plugins", "affinity", { perMessage: 1, announceLevelUp: true });
+    assert(restore.ok && restore.settings.perMessage === 1, "恢复设置失败");
+    return "数字夹紧 / 布尔归一 正常";
+  });
+
+  await test("EXT-07", "会话记录落盘（按群 chatKey）", () => {
+    const id = `selftest-${Date.now().toString(36)}`;
+    extensionHost.recordSession({ id, chatKey: "group:123456", kind: "group", startedAt: Date.now(), usage: { tokensIn: 10, tokensOut: 5, cost: 0.001 }, model: "m", vendor: "v", trigger: [{ senderId: "20001" }] });
+    const file = path.join(extDataDir, "sessions", `${id}.json`);
+    assert(fs.existsSync(file), "会话文件应该写出来");
+    const data = JSON.parse(fs.readFileSync(file, "utf8"));
+    eq(data.chatKey, "group:123456", "chatKey 应该按扩展格式写");
+    eq(data.usage.promptTokens, 10, "token 应为 10");
+    return `会话文件已写入：${path.basename(file)}`;
+  });
+
+  await test("EXT-08", "消息仓：跨成员聚合 / 媒体字段 / findByMid", () => {
+    const platformMessageId = `selftest-mid-${Date.now()}`;
+    storage.insertMessage({
+      eventKey: `selftest-evt-${Date.now()}`,
+      platformMessageId,
+      scopeKey: "group_123456_20001",
+      direction: "in",
+      senderId: "20001",
+      senderName: "群友甲",
+      kind: "group",
+      at: Date.now(),
+      body: "发张图",
+      attachments: [{ type: "image", url: "https://example.com/a.png", file: "" }],
+    });
+    const rows = extensionHost.messageStore().recent("group:123456", { limit: 20 });
+    assert(rows.length > 0, "应该读到消息");
+    const found = rows.find((row) => row.mid === platformMessageId);
+    assert(found, "按群 chatKey 应能读到该成员作用域的消息");
+    eq(found.self, false, "self 标记");
+    assert(found.media.some((item) => item.kind === "image"), "媒体字段应解析出图片");
+    const byMid = extensionHost.messageStore().findByMid("group:123456", platformMessageId);
+    assert(byMid && byMid.text === "发张图", "findByMid 应能精确取到");
+    return `读到 ${rows.length} 条，媒体 ${found.media.length} 个`;
+  });
+
+  await test("EXT-09", "表情收藏：收藏/查询/按 URL 找本地文件", async () => {
+    const { sampleTestPng } = await import("./png.mjs");
+    const store = createStickerStore({ dataDir: path.join(TMP, "stickers"), client: { downloadImage: async () => ({ buffer: sampleTestPng(64), mime: "image/png" }) } });
+    const platformMessageId = `selftest-sticker-${Date.now()}`;
+    storage.insertMessage({
+      eventKey: `selftest-sticker-evt-${Date.now()}`,
+      platformMessageId,
+      scopeKey: "group_123456_20002",
+      direction: "in",
+      senderId: "20002",
+      senderName: "群友乙",
+      kind: "group",
+      at: Date.now(),
+      body: "[图片]",
+      attachments: [{ type: "image", url: "https://example.com/b.png", file: "" }],
+    });
+    const result = await store.collectFromMessage({ chatKey: "group:123456", messageId: platformMessageId, note: "这张好笑" });
+    assert(result && !result.isError, "收藏应该成功：" + (result && result.content));
+    const parsed = JSON.parse(result.content);
+    assert(parsed.id, "应返回收藏 id");
+    eq(store.find(parsed.id).note, "这张好笑", "备注应保存");
+    const localPath = store.pathById(parsed.id);
+    assert(localPath && fs.existsSync(localPath), "收藏的图片文件应存在");
+    assert(store.pathByUrl("https://example.com/b.png"), "按 URL 应能找回本地文件");
+    return `收藏 #${parsed.id} 成功`;
+  });
+
+  await test("EXT-10", "网络边界：内网/本机地址被拒绝", () => {
+    assert(validateExternalUrl("https://example.com/x").startsWith("https://"), "公网地址应放行");
+    let blocked = false;
+    try {
+      validateExternalUrl("http://127.0.0.1:8080/api");
+    } catch {
+      blocked = true;
+    }
+    assert(blocked, "本机地址必须被拒绝");
+    blocked = false;
+    try {
+      validateExternalUrl("http://192.168.1.10/");
+    } catch {
+      blocked = true;
+    }
+    assert(blocked, "内网地址必须被拒绝");
+    return "公网放行 / 本机与内网拒绝";
+  });
+
+  await test("EXT-11", "工具调用循环：tool_calls → 执行 → 回填 → 最终回复", async () => {
+    let round = 0;
+    const gateway = new llmMod.LlmGateway({ budgetGate: new budget.BudgetGate() });
+    const toolCall = { id: "c1", type: "function", function: { name: "ledger__add_record", arguments: '{"who":"阿强"}' } };
+    gateway.chat = async () => {
+      round += 1;
+      if (round === 1) {
+        return { text: "", requestId: "r1", model: "m", profileId: "default", usage: { tokensIn: 10, tokensOut: 2, cost: 0 }, toolCalls: [toolCall], message: { role: "assistant", content: "", tool_calls: [toolCall] }, raw: {} };
+      }
+      return { text: "最终回复", requestId: "r2", model: "m", profileId: "default", usage: { tokensIn: 5, tokensOut: 3, cost: 0 }, toolCalls: [], message: { role: "assistant", content: "最终回复" }, raw: {} };
+    };
+    const ran = [];
+    const result = await gateway.speakWithTools(loadCharacter("testchar"), "记一笔", {
+      tools: [{ type: "function", function: { name: "ledger__add_record", description: "x", parameters: { type: "object", properties: {} } } }],
+      runTool: async (call) => {
+        ran.push(call.name);
+        return { content: "记上了" };
+      },
+      maxRounds: 3,
+    });
+    eq(result.text, "最终回复", "最终回复");
+    eq(ran.length, 1, "工具应执行一次");
+    eq(result.toolEvents.length, 1, "工具事件应记录");
+    eq(result.usage.calls, 2, "两次模型请求");
+    return `两轮请求 + 1 次工具调用：${ran[0]}`;
+  });
+
+  await test("EXT-12", "finish 工具结束本轮（不再发送正文）", async () => {
+    const gateway = new llmMod.LlmGateway({ budgetGate: new budget.BudgetGate() });
+    const toolCall = { id: "c9", type: "function", function: { name: "finish", arguments: "{}" } };
+    gateway.chat = async () => ({ text: "", requestId: "r9", model: "m", profileId: "default", usage: { tokensIn: 3, tokensOut: 1, cost: 0 }, toolCalls: [toolCall], message: { role: "assistant", content: "", tool_calls: [toolCall] }, raw: {} });
+    const result = await gateway.speakWithTools(loadCharacter("testchar"), "结束吧", {
+      tools: [{ type: "function", function: { name: "finish", description: "结束", parameters: { type: "object", properties: {} } } }],
+      runTool: async () => ({ content: "", finish: true }),
+      maxRounds: 3,
+    });
+    eq(result.text, "", "finish 之后不应再有正文");
+    assert(result.finishedByTool === true, "应标记为工具结束");
+    return "finish 正确结束本轮";
+  });
+
+  await test("EXT-13", "chatKey 与心语 scopeKey 的映射", () => {
+    eq(chatKeyOfScope("group_123456_20001"), "group:123456");
+    eq(chatKeyOfScope("private_20001"), "private:20001");
+    assert(extensionHost.messageStore().recent("group:123456", { limit: 1 }).length === 1, "消息仓按 chatKey 可读");
+    return "group:<群号> / private:<QQ号> 映射正确";
+  });
+
+  await test("EXT-14", "扩展主动发送：走客户端 + 出站/消息留档", async () => {
+    const sentCalls = [];
+    const stubClient = {
+      selfId: SELF,
+      sendGroupMsg: async (groupId, message) => {
+        sentCalls.push({ groupId, message });
+        return { message_id: 9001 };
+      },
+      sendPrivateMsg: async () => ({ message_id: 9002 }),
+    };
+    const engine = new ChatEngine({ client: stubClient, llm });
+    const prevPreflight = getConfig().chat.preflightCheck;
+    saveConfig({ chat: { preflightCheck: false } });
+    try {
+      const result = await engine.sendExtensionMessage({ chatKey: "group:123456", scopeKey: "group_123456_20001", text: "扩展主动说一句" });
+      assert(result.ok && result.messageId === "9001", "应返回协议端消息 id");
+      eq(sentCalls.length, 1, "应调用一次 sendGroupMsg");
+      const outgoing = db.one("select * from outgoing where idempotency_key like 'ext:%' order by id desc limit 1");
+      assert(outgoing && outgoing.status === "sent", "出站记录应为 sent");
+      const stored = db.one("select * from messages where scope_key = ? and body = ? order by id desc limit 1", ["group_123456_20001", "扩展主动说一句"]);
+      assert(stored, "消息应入库");
+    } finally {
+      saveConfig({ chat: { preflightCheck: prevPreflight } });
+    }
+    return "发送成功且出站/消息都有留档";
+  });
+
+  extensionHost.dispose();
+
   /* -------------------------------- 收尾 -------------------------------- */
 
   db.closeDb();

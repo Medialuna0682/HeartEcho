@@ -24,7 +24,7 @@ if (!binary) {
   process.exit(2);
 }
 
-const PAGES = ["overview", "account", "dialog", "weather", "studio", "chat", "groups", "memory", "life", "schedule", "qzone", "llm", "system", "logs"];
+const PAGES = ["overview", "account", "dialog", "weather", "extensions", "studio", "chat", "groups", "memory", "life", "schedule", "qzone", "llm", "system", "logs"];
 const profile = path.join(os.tmpdir(), `heartecho-pages-${Date.now().toString(36)}`);
 const child = spawn(
   binary,

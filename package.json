@@ -1,9 +1,9 @@
 {
   "name": "heartecho",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "private": true,
   "type": "module",
-  "description": "心语 · HeartEcho：一个自托管的 QQ 人格化数字伴侣。分层人格提示词、分层记忆、数字生命与天气感知的主动社交，配一个圆润简洁的可视化控制面板；零第三方运行时依赖（Node 内置模块 + node:sqlite）",
+  "description": "心语 · HeartEcho：一个自托管的 QQ 人格化数字伴侣。分层人格提示词、分层记忆、数字生命与天气感知的主动社交、插件/技能扩展系统（function calling），配一个圆润简洁的可视化控制面板；零第三方运行时依赖（Node 内置模块 + node:sqlite）",
   "main": "index.mjs",
   "keywords": [
     "qq-bot",
@@ -23,6 +23,8 @@
     "tray": "node index.mjs --tray",
     "probe": "node index.mjs --probe",
     "selftest": "node tools/selftest.mjs",
+    "test:extensions": "node tools/extensions-test.mjs",
+    "gen:extensions": "node tools/gen-extensions.mjs",
     "test:security": "node --test tools/security-test.mjs",
     "smoke": "node tools/smoke.mjs",
     "build:exe": "node tools/build-exe.mjs",

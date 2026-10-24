@@ -199,12 +199,13 @@ node tools/exe-verify.mjs                     # 干净机验收（在隔离沙�
 
 ```powershell
 node tools/smoke.mjs              # 模块冒烟：所有模块能加载、核心对象能创建、前端脚本语法正确
-node tools/selftest.mjs           # 离线自检 44 项（不花模型钱，用临时数据目录）
+node tools/selftest.mjs           # 离线自检 95 项（不花模型钱，用临时数据目录）
 node tools/selftest.mjs --with-llm  # 额外跑 5 项需要模型接口的用例
+node tools/extensions-test.mjs    # 16 个插件/技能包的离线单测（每个包独立子进程）
 node tools/backup-verify.mjs      # 备份/恢复演练：证明备份真的能恢复出完整数据
 node tools/check-identifiers.mjs  # 静态检查：有没有"导入了不存在的名字"
 node tools/check-ui-template.mjs  # 前端模板引号错配检查
-node tools/check-pages.mjs        # 用无头浏览器逐页检查控制面板
+node tools/check-pages.mjs        # 用无头浏览器逐页检查控制面板（含「插件与技能」页）
 node tools/browser-check.mjs      # 单页检查 + 收集控制台错误 + 截图
 node tools/shoot.mjs <目录>       # 批量截图（自查观感用）
 node tools/exe-verify.mjs         # 单文件 exe 干净机验收
@@ -436,6 +437,22 @@ node tools/e2e-live.mjs --bot <机器人QQ> --peer <你的QQ> --probe <另一个
 - **一个实测到的坑**：腾讯对「短时间连续发说说」有节流，连发两条可能只留下最后一条。
   `tools/qzone-interact-verify.mjs` 里因此加了冷却，别在几分钟内连着发。
 
+### 9. 插件与技能（扩展）
+
+心语内置了一套扩展系统：16 个「插件 / 技能」包（来自公开的 QQ Agent 0.4 生态，已适配心语），
+在面板左侧 **「插件与技能」** 页可以逐个开关、改设置，停用/启用即时生效。
+
+- **插件**提供确定性能力：群友好感度、连发合并、上下文插话判定、跨会话认人、群友花费统计、自己上网。
+- **技能**给模型注册工具 + 提示词片段：小本本（人情账）、去 AI 味、表情品味、回复配图、智能配图、
+  搜图、QQ 空间、空间与资料、API 余额乞讨、网页/B 站/RSS 读取。
+- 模型可以自己调用这些工具（function calling）；页面顶部有总开关和「一轮最多几轮工具调用」。
+- 扩展的网络只能走宿主统一的 `api.fetch`（内网/本机地址会被拒、8 MB 上限），发送只能走
+  `ctx.sender`（与正常回复共用出站表与发送前检查），数据只写 `data/extensions/<id>/`。
+
+完整说明（每个扩展做什么、默认开关、目录结构、怎么写新扩展、来源与许可）见
+[`EXTENSIONS.md`](EXTENSIONS.md)。**注意**：原始扩展素材没有附带许可证，公开分发前请先
+确认各作者的授权（细节见 EXTENSIONS.md 第六节）。
+
 ---
 
 ## 三、钱是怎么被守住的
@@ -482,6 +499,7 @@ E:\心语\
 ├── index.mjs                  ← 主程序（源码方式启动走这个）
 ├── 启动心语.bat               ← 双击启动（必须是 GBK + CRLF 编码，否则中文会乱码）
 ├── 心语设置.json              ← 数据/日志/协议端目录（面板也能改）
+├── extensions\                ← 插件 / 技能包（16 个，含兼容层 extensions/src）
 ├── lib\
 │   ├── paths.mjs              目录解析与设置
 │   ├── config.mjs             配置、角色卡、默认值
@@ -492,9 +510,12 @@ E:\心语\
 │   ├── life.mjs               数字生命：状态、关系、经历、反思、日记
 │   ├── policy.mjs             黑名单、屏蔽词状态机、限流、总裁决
 │   ├── budget.mjs             预算闸门与账单
-│   ├── llm.mjs                模型网关：分层提示词、任务路由、重试
+│   ├── llm.mjs                模型网关：分层提示词、任务路由、重试、工具调用循环
+│   ├── extensions.mjs         扩展宿主：清单/设置/生命周期/钩子/能力/提示词片段/会话记录
+│   ├── tools.mjs              工具注册表与 function calling 基础设施
+│   ├── stickers.mjs           表情收藏（核心）
 │   ├── onebot.mjs             OneBot 适配器、事件标准化
-│   ├── chat.mjs               会话编排、消息合并、气泡发送
+│   ├── chat.mjs               会话编排、消息合并、气泡发送、扩展集成
 │   ├── scheduler.mjs          主动问候、天气提醒、节日生日、提醒、幂等
 │   ├── weather.mjs            定位、天气、值得提醒的判定
 │   ├── qzone.mjs              空间能力门控与读写
@@ -504,12 +525,13 @@ E:\心语\
 │   ├── desktop.mjs            托盘、应用窗口、开机自启、重启自己
 │   ├── api.mjs                本地控制 API
 │   └── ui*.mjs                控制面板（HTML/CSS/JS 全部内联）
-├── tools\                     自检、冒烟、端到端、打包、浏览器检查等工具
+├── tools\                     自检、扩展测试、冒烟、端到端、打包、浏览器检查等工具
 ├── build\                     打包中间产物（bundle.cjs / blob / 图标）
 └── data\
     ├── config.json            面板改的所有设置
     ├── characters\*.json      角色卡
     ├── database\main.db       消息、记忆、账单、审计
+    ├── extensions\            插件/技能的数据、收藏的表情、会话记录
     ├── logs\                  运行日志（默认保留 14 天）
     ├── backups\               数据库快照（保留最近 10 份）
     └── cache\media\exports\   临时文件、附件、导出
@@ -749,5 +771,10 @@ PARTICULAR PURPOSE. See the GNU Affero General Public License for more details.
 
 第三方组件不在这份许可证范围内：协议端（SnowLuma / NapCat 等）由各自作者独立授权，
 本项目既不内嵌也不修改它——所以用它之前请自己确认它的许可条款。
+
+`extensions/` 下的 16 个插件/技能包是从公开的 QQ Agent 0.4 扩展生态移植的，版权归各包作者
+（manifest 的 `author` 字段）。**原始素材没有附带许可证**：公开分发合集之前，请先确认各作者
+的授权；无法确认时删除 `extensions/plugins|skills/` 对应目录即可（不影响主程序）。
+详见 [`EXTENSIONS.md`](EXTENSIONS.md) 第六节。
 
 Copyright (C) 2026 RCEY-123

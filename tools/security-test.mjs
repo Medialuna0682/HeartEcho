@@ -428,3 +428,88 @@ test("schema v1 upgrade preserves existing conversations", () => {
 test("panel JavaScript parses after auth and ownership UI changes", () => {
   new vm.Script(APP_JS);
 });
+
+/* ------------------------------ 插件 / 技能扩展边界 ------------------------------ */
+
+test("extension packages stay inside the documented boundaries", async () => {
+  const { fileURLToPath } = await import("node:url");
+  const root = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
+  const extRoot = path.join(root, "extensions");
+  assert.ok(fs.existsSync(extRoot), "extensions/ 目录应该存在");
+  const files = [];
+  const walk = (dir) => {
+    for (const name of fs.readdirSync(dir)) {
+      const file = path.join(dir, name);
+      const stat = fs.statSync(file);
+      if (stat.isDirectory()) {
+        // 兼容层是宿主自己的代码，不算扩展包
+        if (path.relative(extRoot, file).split(path.sep)[0] === "src") continue;
+        assert.ok(name !== "node_modules", `扩展目录不允许带 node_modules：${file}`);
+        walk(file);
+      } else files.push(file);
+    }
+  };
+  walk(extRoot);
+
+  const forbiddenFiles = /\.(exe|dll|node|bat|cmd|ps1|msi|sys)$/i;
+  const forbiddenCode = [
+    [/\bchild_process\b/, "child_process（扩展不允许起子进程）"],
+    [/\bexecFile\s*\(/, "execFile"],
+    [/\bexecSync\s*\(/, "execSync"],
+    [/\bnew\s+Function\s*\(/, "new Function"],
+    [/\beval\s*\(/, "eval"],
+    [/\bprocess\.env\b/, "process.env（环境变量不允许直接读）"],
+    [/\bhttps?\.request\s*\(/, "http.request"],
+    [/\bXMLHttpRequest\b/, "XMLHttpRequest"],
+    [/from\s+["'][^"']*\?v=\d/, "带 ?v= 的 import（打包会失败）"],
+  ];
+  for (const file of files) {
+    const rel = path.relative(extRoot, file);
+    assert.ok(!forbiddenFiles.test(file), `扩展目录不允许可执行文件：${rel}`);
+    if (!file.endsWith(".js")) continue;
+    // 只看代码，注释里的说明（"删掉 child_process 依赖"）不算违规
+    const raw = fs.readFileSync(file, "utf8");
+    const code = raw
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/(^|[^:"])\/\/.*$/gm, "$1");
+    for (const [pattern, label] of forbiddenCode) {
+      assert.ok(!pattern.test(code), `${rel} 命中禁止项：${label}`);
+    }
+    // 网络必须走宿主注入的 api.fetch；不允许裸 fetch(
+    for (const match of code.matchAll(/(?<![.\w$])fetch\s*\(/g)) {
+      const before = code.slice(Math.max(0, match.index - 60), match.index);
+      const injected = /(?:const|let|var)\s+[\w$]+\s*=\s*api\.fetch|=\s*api\.fetch|fetchImpl\s*\(/.test(before);
+      assert.ok(injected, `${rel} 直接调用了全局 fetch（网络必须走 api.fetch）`);
+    }
+  }
+
+  // 清单：id 与目录名一致、apiVersion 合法、入口存在
+  for (const kind of ["plugins", "skills"]) {
+    const dir = path.join(extRoot, kind);
+    if (!fs.existsSync(dir)) continue;
+    for (const name of fs.readdirSync(dir)) {
+      const packageDir = path.join(dir, name);
+      if (!fs.statSync(packageDir).isDirectory()) continue;
+      const manifestFile = path.join(packageDir, kind === "plugins" ? "plugin.json" : "skill.json");
+      assert.ok(fs.existsSync(manifestFile), `${kind}/${name} 缺少清单`);
+      const manifest = JSON.parse(fs.readFileSync(manifestFile, "utf8"));
+      assert.equal(String(manifest.id), name, `${kind}/${name} 的 manifest id 必须与目录名一致`);
+      assert.ok(manifest.name && manifest.version, `${kind}/${name} 清单缺少 name/version`);
+      if (manifest.apiVersion !== undefined) assert.equal(Number(manifest.apiVersion), 1, `${kind}/${name} API 版本不支持`);
+      assert.ok(fs.existsSync(path.join(packageDir, String(manifest.entry || "index.js"))), `${kind}/${name} 入口不存在`);
+    }
+  }
+});
+
+test("extension host rejects internal/private fetch targets and sanitizes tool names", async () => {
+  const { validateExternalUrl } = await import("../lib/extensions.mjs");
+  const { ToolRegistry } = await import("../lib/tools.mjs");
+  assert.throws(() => validateExternalUrl("http://127.0.0.1:8080/x"), /内网|本机/);
+  assert.throws(() => validateExternalUrl("http://192.168.1.2/x"), /内网|本机/);
+  assert.throws(() => validateExternalUrl("file:///C:/x"), /http/);
+  assert.match(validateExternalUrl("https://example.com/a"), /^https:\/\/example\.com\/a$/);
+  const registry = new ToolRegistry();
+  const entry = registry.register("demo-skill", { id: "do.thing", description: "x", execute: async () => ({ content: "ok" }) });
+  assert.match(entry.name, /^[a-zA-Z0-9_-]{1,64}$/);
+  assert.throws(() => registry.register("demo-skill", { id: "do.thing", description: "dup" }), /重复/);
+});

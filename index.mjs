@@ -41,6 +41,7 @@ import { OneBot, normalizeEvent, dataUrlFromLocalFile } from "./lib/onebot.mjs";
 import { LlmGateway } from "./lib/llm.mjs";
 import { BudgetGate } from "./lib/budget.mjs";
 import { ChatEngine } from "./lib/chat.mjs";
+import { ExtensionHost } from "./lib/extensions.mjs";
 import { gate, pauseState, audit } from "./lib/policy.mjs";
 import { Scheduler } from "./lib/scheduler.mjs";
 import { QZoneAdapter } from "./lib/qzone.mjs";
@@ -223,6 +224,14 @@ async function main() {
   });
   const qzoneScheduler = new QZoneScheduler({ qzone, llm });
 
+  /*
+   * 插件/技能扩展宿主。
+   * 装载放在「面板启动之前、QQ 连接之前」：这样第一轮对话开始前工具和提示词片段就都齐了。
+   * 自检模式只装载不激活（不能起定时器），别的模式正常激活。
+   */
+  const extensions = new ExtensionHost({ llm, client, engine: chat });
+  chat.extensions = extensions;
+
   if (PROBE) {
     await runProbe({ client, llm, qzone });
     closeDb();
@@ -288,7 +297,9 @@ async function main() {
       return;
     }
     const { runSelfTest } = await import("./tools/selftest.mjs");
-    const result = await runSelfTest({ client, llm, chat, qzone });
+    await extensions.init({ setup: true, activate: false });
+    const result = await runSelfTest({ client, llm, chat, qzone, extensions });
+    extensions.dispose();
     closeDb();
     process.exitCode = result.failed ? 1 : 0;
     return;
@@ -530,6 +541,13 @@ async function main() {
     },
   };
 
+  // 扩展装载：单个扩展失败只影响它自己，绝不阻塞主程序启动
+  try {
+    await extensions.init({ setup: true, activate: true });
+  } catch (error) {
+    log.error(`扩展装载失败（不影响机器人本体）：${error?.message ?? error}`);
+  }
+
   const server = createApiServer({
     client,
     llm,
@@ -539,6 +557,7 @@ async function main() {
     qzone,
     qzoneScheduler,
     budgetGate,
+    extensions,
     paths,
     log,
     control,
@@ -659,6 +678,7 @@ async function main() {
       chat.stop();
       scheduler.stop();
       qzoneScheduler.stop();
+      extensions.dispose();
       clearInterval(lifeTimer);
       clearInterval(diaryTimer);
       server.close();

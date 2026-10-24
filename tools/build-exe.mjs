@@ -194,6 +194,15 @@ async function main() {
 
   /* ① 打成一个 JS */
   const bundle = path.join(BUILD_DIR, "bundle.cjs");
+  /*
+   * 打包前先扫描 extensions/ 生成静态注册表：
+   * SEA 里没法从磁盘 import 扩展，只能让 esbuild 把它们一起打进单文件。
+   * 生成失败（manifest 坏了/入口缺失）就直接停下——不然 exe 里会静默少几个扩展。
+   */
+  log("① 生成扩展注册表…");
+  const genResult = spawnSync(process.execPath, [path.join(ROOT, "tools", "gen-extensions.mjs")], { cwd: ROOT, encoding: "utf8" });
+  if (genResult.status !== 0) fail(`生成扩展注册表失败：\n${genResult.stderr || genResult.stdout}`);
+  if (genResult.stdout?.trim()) console.log(genResult.stdout.trim().split(/\r?\n/).map((line) => `   ${line}`).join("\n"));
   log("① esbuild 打包成一个文件…");
   const esbuildArgs = [
     path.join(ROOT, "index.mjs"),
