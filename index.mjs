@@ -35,7 +35,12 @@ import {
   activeCharacterId,
   listCharacters,
   loadCharacter,
+  saveCharacter,
 } from "./lib/config.mjs";
+import { InteractionService } from "./lib/interactions.mjs";
+import { TbGroupService, TB_CHARACTER } from "./lib/tb.mjs";
+import { archiveExtendedDaily, memoryConsentValid } from "./lib/extended-memory.mjs";
+import { startManagedHindsight } from "./lib/hindsight-runtime.mjs";
 import { getDb, closeDb, migrate, backup, integrityCheck, claimEventKey } from "./lib/db.mjs";
 import { OneBot, normalizeEvent, dataUrlFromLocalFile } from "./lib/onebot.mjs";
 import { LlmGateway } from "./lib/llm.mjs";
@@ -182,6 +187,12 @@ async function runProbe({ client, llm, qzone }) {
 async function main() {
   ensureDirs();
   ensureConfigFile();
+  if (has("--tb") && !getConfig().tb.initialized) {
+    saveCharacter(TB_CHARACTER.id, TB_CHARACTER);
+    saveConfig({ tb: { enabled: true, initialized: true }, activeCharacter: TB_CHARACTER.id,
+      bot: { panelPort: 5321, onebotWsUrl: "ws://127.0.0.1:3103/", onebotHttpUrl: "http://127.0.0.1:3102/" },
+      chat: { replyGroupAll: false, replyGroupAt: true, useEmoji: false } });
+  }
   // 第一次启动生成一个本机专用的协议端访问令牌（不写死公共值，见 config.mjs 注释）
   const tokenInfo = ensureLocalToken();
   const cfg = getConfig();
@@ -222,6 +233,8 @@ async function main() {
     },
   });
   const qzoneScheduler = new QZoneScheduler({ qzone, llm });
+  const tb = new TbGroupService({ client, chat });
+  const interactions = new InteractionService({ client, chat, tb });
 
   if (PROBE) {
     await runProbe({ client, llm, qzone });
@@ -497,6 +510,7 @@ async function main() {
   client.on("event", async (event) => {
     try {
       if (event.post_type !== "message") {
+        await interactions.receive(event);
         if (event.post_type === "notice" && event.notice_type === "friend_add") log.info(`新好友：${event.user_id}`);
         return;
       }
@@ -509,6 +523,7 @@ async function main() {
         return;
       }
       if (String(normalized.senderId) === String(now.bot.selfId)) return;
+      if (await interactions.adminCommand(normalized)) return;
       await chat.receive(normalized);
     } catch (error) {
       log.error(`事件处理失败：${error?.stack ?? error}`);
@@ -542,6 +557,7 @@ async function main() {
     paths,
     log,
     control,
+    tb,
   });
 
   let listenError = null;
@@ -597,6 +613,7 @@ async function main() {
     if (pauseState.paused) return;
     const now = getConfig();
     if (now.life?.archive?.enabled === false) return;
+    if (now.nextMemory.enabled) return;
     const hour = new Date().getHours();
     const from = Number(now.life?.archive?.fromHour ?? 7);
     const to = Number(now.life?.archive?.toHour ?? 23);
@@ -606,10 +623,22 @@ async function main() {
     );
   }, Math.max(10, Number(cfg.life?.archive?.everyMinutes) || 120) * 60000);
   lifeTimer.unref?.();
+  const extendedTimer = setInterval(() => {
+    if (pauseState.paused) return;
+    archiveExtendedDaily(llm).catch((error) => log.warn(`每日记忆归档失败：${error.message}`));
+    for (const [gid, settings] of Object.entries(getConfig().tb.groups)) {
+      if (getConfig().tb.enabled && settings.enabled && settings.source !== "custom") tb.refreshRules(gid).catch(() => {});
+    }
+  }, 300000);
+  extendedTimer.unref?.();
+  if (getConfig().nextMemory.enabled && memoryConsentValid() && getConfig().nextMemory.baseUrl.replace(/\/$/, "") === "http://127.0.0.1:8888") {
+    startManagedHindsight().catch((error) => log.warn(`记忆服务未启动，继续使用本地能力：${error.message}`));
+  }
 
   const diaryTimer = setInterval(() => {
     const now = getConfig();
     if (now.life?.diary?.enabled === false) return;
+    if (now.nextMemory.enabled) return;
     const [hour, minute] = String(now.life?.diary?.at ?? "22:30").split(":").map(Number);
     const date = new Date();
     if (date.getHours() !== hour || date.getMinutes() < minute) return;
@@ -657,6 +686,8 @@ async function main() {
     log.warn(`${signal}，正在退出…`);
     try {
       chat.stop();
+      tb.stop();
+      clearInterval(extendedTimer);
       scheduler.stop();
       qzoneScheduler.stop();
       clearInterval(lifeTimer);
