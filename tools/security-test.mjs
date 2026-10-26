@@ -421,7 +421,7 @@ test("schema v1 upgrade preserves existing conversations", () => {
   db.exec("drop table scope_resets; pragma user_version = 1");
   db.closeDb(); db.getDb();
   assert.equal(storage.messageCount("private_30000008"), before);
-  assert.equal(db.one("pragma user_version").user_version, 2);
+  assert.equal(db.one("pragma user_version").user_version, db.SCHEMA_VERSION);
   assert.equal(lifecycle.scopeGeneration("private_30000008"), 0);
 });
 

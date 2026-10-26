@@ -26,6 +26,8 @@
     "test:extensions": "node tools/extensions-test.mjs",
     "gen:extensions": "node tools/gen-extensions.mjs",
     "test:security": "node --test tools/security-test.mjs",
+    "test:next": "node --test tools/next-version-test.mjs",
+    "package:tb": "node tools/package-tb.mjs",
     "smoke": "node tools/smoke.mjs",
     "build:exe": "node tools/build-exe.mjs",
     "check:pages": "node tools/check-pages.mjs",

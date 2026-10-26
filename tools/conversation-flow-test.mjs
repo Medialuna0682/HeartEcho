@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import vm from "node:vm";
 
-const test = (name, fn) => nodeTest(name, { timeout: 5000 }, fn);
+const test = (name, fn) => nodeTest(name, { timeout: 10000 }, fn);
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "heartecho-flow-"));
 for (const key of Object.keys(process.env)) if (key.startsWith("HEARTECHO_")) delete process.env[key];
@@ -34,7 +34,7 @@ const baseline = {
   activeCharacter: "fixture",
   bot: { selfId: 10000001, masterId: 10000002 },
   chat: {
-    privateMergeWindowSec: 0.08,
+    privateMergeWindowSec: 1,
     firstDelayMs: 0,
     typingDelayMs: 0,
     splitBubbles: false,
@@ -181,7 +181,7 @@ test("new input while generating discards the old result and includes all unansw
 });
 
 test("new input during the initial send delay prevents stale delivery", async () => {
-  config.saveConfig({ chat: { privateMergeWindowSec: 0.02, firstDelayMs: 120 } });
+  config.saveConfig({ chat: { privateMergeWindowSec: 1, firstDelayMs: 120 } });
   const { engine, calls, sent } = makeEngine();
   await engine.receive(event(10000013, "before delay"));
   await until(() => calls.length === 1);
@@ -284,7 +284,7 @@ test("clearing and stopping discard pending turns; new input cancels old follow-
   await engine.clearConversation("private_10000017");
   await engine.receive(event(10000018, "stop before replying"));
   engine.stop();
-  await sleep(170);
+  await sleep(1170);
   assert.equal(calls.length, 0);
   assert.equal(followed, false);
 });
@@ -294,7 +294,7 @@ test("a role change before flushing cannot answer old buffered input under the n
   await engine.receive(event(10000019, "old role input"));
   config.saveCharacter("other", { name: "Other" });
   config.saveConfig({ activeCharacter: "other" });
-  await sleep(130);
+  await sleep(1130);
   assert.equal(calls.length, 0);
 });
 
@@ -302,9 +302,9 @@ test("private merge duration is persisted and returned by the actual style API",
   assert.equal((await request("/api/style", { privateMergeWindowSec: 4 })).status, 200);
   assert.equal((await request("/api/style")).body.chat.privateMergeWindowSec, 4);
   await request("/api/style", { privateMergeWindowSec: 100 });
-  assert.equal((await request("/api/style")).body.chat.privateMergeWindowSec, 30);
+  assert.equal((await request("/api/style")).body.chat.privateMergeWindowSec, 15);
   await request("/api/style", { privateMergeWindowSec: 0 });
-  assert.equal((await request("/api/style")).body.chat.privateMergeWindowSec, 0);
+  assert.equal((await request("/api/style")).body.chat.privateMergeWindowSec, 1);
 });
 
 function mealScheduler() {

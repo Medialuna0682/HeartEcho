@@ -1,5 +1,7 @@
 # 心语 · HeartEcho
 
+新版本的记忆、互动与独立 TB 版见 [使用说明](docs/NEXT-VERSION.md)。本地开发可运行 `npm run test:next`；Windows 上用 Node 24 执行 `npm run package:tb` 生成独立 TB 便携目录。
+
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
 [![Node](https://img.shields.io/badge/node-%E2%89%A522.5-brightgreen.svg)](package.json)
 
