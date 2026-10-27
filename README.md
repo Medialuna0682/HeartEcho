@@ -201,7 +201,7 @@ node tools/exe-verify.mjs                     # 干净机验收（在隔离沙�
 
 ```powershell
 node tools/smoke.mjs              # 模块冒烟：所有模块能加载、核心对象能创建、前端脚本语法正确
-node tools/selftest.mjs           # 离线自检 95 项（不花模型钱，用临时数据目录）
+node tools/selftest.mjs           # 离线自检 98 项（不花模型钱，用临时数据目录）
 node tools/selftest.mjs --with-llm  # 额外跑 5 项需要模型接口的用例
 node tools/extensions-test.mjs    # 16 个插件/技能包的离线单测（每个包独立子进程）
 node tools/backup-verify.mjs      # 备份/恢复演练：证明备份真的能恢复出完整数据
@@ -324,8 +324,11 @@ node tools/e2e-live.mjs --bot <机器人QQ> --peer <你的QQ> --probe <另一个
 - 顺带处理两个常见的兼容坑：
   - 某些模型（如 Kimi k2.7 系列）**只接受 `temperature = 1`**，传别的值直接 400。
     遇到就自动压成 1 并记住，不再每轮都失败一次；
-  - 带思考的模型会把小预算全花在 `reasoning_content` 上、正文为空，
-    测试连接会自动放大预算再问一次，对话里也会自动提高 `max_tokens` 重试。
+  - 带思考的模型会把小预算全花在 `reasoning_content` 上、正文为空。现在：
+    「模型与资费 → 单次回复上限」可以拉到 **65536**（面板上还有「单次回复上限调到最大」按钮），
+    测试连接会自动放大预算再问一次，对话里遇到空正文也会按 ×4 逐级放大重试；
+    如果某家模型吃不下这么大的 `max_tokens`，请求会自动降级到它能接受的值并记住，不再反复撞 400。
+    这只是**上限**，实际按返回的 token 数计费，不会按上限扣钱。
 - 换模型/换服务商时会**一并校正上下文长度、看图能力与价格**——否则换了贵的模型，
   预算还按便宜的价格估，等于没设上限。
 

@@ -83,6 +83,7 @@ async function main() {
   const llmMod = await import("../lib/llm.mjs");
   const { ChatEngine } = await import("../lib/chat.mjs");
   const configMod = await import("../lib/config.mjs");
+  const providersMod = await import("../lib/providers.mjs");
   const recoveryMod = await import("../lib/recovery.mjs");
   const weatherMod = await import("../lib/weather.mjs");
   const { Scheduler } = scheduler;
@@ -1606,6 +1607,83 @@ async function main() {
     assert(preset.vision === true, "kimi-k2.6 应该标记为支持看图（实测过）");
     saveConfig({ llm: { profiles: { default: before } } });
     return `kimi-k2.6 上下文 ${Math.round(preset.contextTokens / 1000)}k、支持看图`;
+  });
+
+  await test("FR-940", "「单次回复上限」能调到 65536，超出的自动夹回", () => {
+    const MAX = providersMod.MAX_OUTPUT_TOKENS;
+    const before = getConfig().llm.profiles.default;
+    try {
+      const saved = saveConfig({ llm: { profiles: { default: { ...before, maxTokens: MAX } } } });
+      eq(saved.llm.profiles.default.maxTokens, MAX, "应该能保存到上限");
+      const clamped = saveConfig({ llm: { profiles: { default: { ...before, maxTokens: MAX + 9999 } } } });
+      eq(clamped.llm.profiles.default.maxTokens, MAX, "比上限还大的要夹回到上限");
+      const raised = saveConfig({ llm: { profiles: { default: { ...before, maxTokens: 1 } } } });
+      eq(raised.llm.profiles.default.maxTokens, 64, "太小的要抬到 64");
+    } finally {
+      saveConfig({ llm: { profiles: { default: before } } });
+    }
+    return `上限 ${MAX}；超出夹回、过小抬到 64`;
+  });
+
+  await test("FR-941", "厂商嫌 max_tokens 太大时自动降级，并记住这家模型的上限", async () => {
+    const MAX = providersMod.MAX_OUTPUT_TOKENS;
+    const originalFetch = globalThis.fetch;
+    const before = getConfig().llm.profiles.default;
+    const sent = [];
+    let rejected = 0;
+    globalThis.fetch = async (url, init) => {
+      const body = JSON.parse(init.body);
+      sent.push(body.max_tokens);
+      if (body.max_tokens > 6000) {
+        rejected += 1;
+        return new Response(JSON.stringify({ error: { message: "max_tokens is too large for this model (max 6000)" } }), { status: 400, headers: { "content-type": "application/json" } });
+      }
+      return new Response(JSON.stringify({ choices: [{ message: { content: "在的" }, finish_reason: "stop" }], usage: { prompt_tokens: 6, completion_tokens: 2 } }), { status: 200, headers: { "content-type": "application/json" } });
+    };
+    try {
+      saveConfig({ llm: { profiles: { default: { ...before, provider: "deepseek", baseUrl: "http://127.0.0.1:9/v1", apiKey: "sk-selftest", model: "mock-max-tokens", maxTokens: MAX, priceIn: 0, priceOut: 0 } } } });
+      const gateway = new llmMod.LlmGateway({ budgetGate: new budget.BudgetGate() });
+      const result = await gateway.chat([{ role: "user", content: "在吗" }], { task: "chat", skipBudget: true });
+      eq(result.text, "在的");
+      eq(sent[0], MAX, "第一次应该按用户设置的上限发");
+      eq(sent.at(-1), 6000, "应该降到报错里写的 6000");
+      const count = sent.length;
+      const again = await gateway.chat([{ role: "user", content: "还在吗" }], { task: "chat", skipBudget: true });
+      eq(again.text, "在的");
+      eq(sent[count], 6000, "第二次应该直接用记住的 6000，不再先撞 400");
+      eq(rejected, 1, "只应该被拒一次");
+    } finally {
+      globalThis.fetch = originalFetch;
+      saveConfig({ llm: { profiles: { default: before } } });
+    }
+    return `65536 → 6000 自动降级，之后的请求直接按 6000 发`;
+  });
+
+  await test("FR-942", "思考烧光额度时逐级放大到上限再要，而不是直接报空正文", async () => {
+    const MAX = providersMod.MAX_OUTPUT_TOKENS;
+    const originalFetch = globalThis.fetch;
+    const before = getConfig().llm.profiles.default;
+    const sent = [];
+    globalThis.fetch = async (url, init) => {
+      const body = JSON.parse(init.body);
+      sent.push(body.max_tokens);
+      if (sent.length < 4) {
+        return new Response(JSON.stringify({ choices: [{ message: { content: "", reasoning_content: "还在想……" }, finish_reason: "length" }], usage: { prompt_tokens: 6, completion_tokens: 10 } }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return new Response(JSON.stringify({ choices: [{ message: { content: "想好了，在的" }, finish_reason: "stop" }], usage: { prompt_tokens: 6, completion_tokens: 5 } }), { status: 200, headers: { "content-type": "application/json" } });
+    };
+    try {
+      saveConfig({ llm: { profiles: { default: { ...before, provider: "deepseek", baseUrl: "http://127.0.0.1:9/v1", apiKey: "sk-selftest", model: "mock-thinking", maxTokens: 700, priceIn: 0, priceOut: 0 } } } });
+      const gateway = new llmMod.LlmGateway({ budgetGate: new budget.BudgetGate() });
+      const result = await gateway.chat([{ role: "user", content: "在吗" }], { task: "chat", skipBudget: true });
+      eq(result.text, "想好了，在的");
+      eq(sent.join(","), "700,4000,16000,64000", "应该按 ×4 逐级放大，最高停在全局天花板以内");
+      assert(Math.max(...sent) <= MAX, "不该超过全局天花板");
+    } finally {
+      globalThis.fetch = originalFetch;
+      saveConfig({ llm: { profiles: { default: before } } });
+    }
+    return "700 → 4000 → 16000 → 64000，第 4 次拿到正文";
   });
 
   /* --------------------------------- 天气 --------------------------------- */
