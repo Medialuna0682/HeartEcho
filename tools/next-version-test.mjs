@@ -597,12 +597,12 @@ test("the TB launcher uses separate default storage, and Docker auth configurati
     [
       "--input-type=module",
       "-e",
-      "process.argv.push('fixture','--tb');await import('./lib/boot-env.mjs');console.log(process.env.HEARTECHO_DATA_DIR)",
+      "process.argv.push('fixture','--tb');await import('./lib/boot-env.mjs');console.log((await import('./lib/paths.mjs')).paths.data)",
     ],
     {
       cwd: path.resolve(import.meta.dirname, ".."),
       encoding: "utf8",
-      env: Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("HEARTECHO_"))),
+      env: { ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("HEARTECHO_"))), LOCALAPPDATA: tmp },
     },
   );
   assert.equal(result.status, 0, result.stderr);

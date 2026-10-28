@@ -23,7 +23,7 @@ if errorlevel 1 (
 title 心语 · 源码模式
 echo 正在以源码模式启动心语…（关掉这个窗口 = 停止运行）
 :loop
-node index.mjs
+node index.mjs --tray --open-panel
 set CODE=%errorlevel%
 if "%CODE%"=="0" goto end
 if "%CODE%"=="42" (

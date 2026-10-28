@@ -6,7 +6,7 @@
  */
 import fs from "node:fs";
 
-const file = process.argv[2] || "E:\\心语\\lib\\ui-app.mjs";
+const file = process.argv[2] || new URL("../lib/ui-app.mjs", import.meta.url);
 const content = fs.readFileSync(file, "utf8");
 const start = content.indexOf("String.raw`");
 const end = content.lastIndexOf("`;");

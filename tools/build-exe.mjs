@@ -204,6 +204,7 @@ async function main() {
   if (genResult.status !== 0) fail(`生成扩展注册表失败：\n${genResult.stderr || genResult.stdout}`);
   if (genResult.stdout?.trim()) console.log(genResult.stdout.trim().split(/\r?\n/).map((line) => `   ${line}`).join("\n"));
   log("① esbuild 打包成一个文件…");
+  const appVersion = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8")).version;
   const esbuildArgs = [
     path.join(ROOT, "index.mjs"),
     "--bundle",
@@ -211,7 +212,7 @@ async function main() {
     "--format=cjs",
     "--target=node22",
     `--outfile=${bundle}`,
-    "--banner:js=globalThis.__HEARTECHO_BUNDLED__=true;",
+    `--banner:js=globalThis.__HEARTECHO_BUNDLED__=true;globalThis.__HEARTECHO_VERSION__=${JSON.stringify(appVersion)};`,
     "--log-level=warning",
   ];
   // 直接 spawn 真正的 esbuild.exe（不经 shell），参数里带空格也没问题

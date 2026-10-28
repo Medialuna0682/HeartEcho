@@ -23,7 +23,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { createHash } from "node:crypto";
-import { ensureDirs, paths, isSea, loadSettings, saveSettings } from "./lib/paths.mjs";
+import { ensureDirs, paths, isSea, isInstalled, loadSettings, saveSettings } from "./lib/paths.mjs";
 import { createLogger, pruneLogs, setLogLevel, getLogLevel, redactText } from "./lib/log.mjs";
 import {
   ensureConfigFile,
@@ -68,6 +68,7 @@ import { listSessions, scopeLabel } from "./lib/storage.mjs";
 import { archiveOnce, writeDiary } from "./lib/life.mjs";
 import { forecast as fetchWeather, summarize as summarizeWeather } from "./lib/weather.mjs";
 import { recoverMissedMessages } from "./lib/recovery.mjs";
+import { panelLaunchUrl } from "./lib/panel-auth.mjs";
 
 const argv = process.argv.slice(2);
 const has = (flag) => argv.includes(flag);
@@ -95,6 +96,8 @@ const INSTALL_AUTOSTART = has("--install-autostart");
 const REMOVE_AUTOSTART = has("--remove-autostart");
 const AUTOSTART_STATUS = has("--autostart-status");
 const DESKTOP_CHECK = has("--desktop-check");
+const OPEN_PANEL = has("--open-panel");
+const PANEL_URL = has("--panel-url");
 
 const log = createLogger("Main");
 
@@ -194,6 +197,11 @@ async function main() {
       bot: { panelPort: 5321, onebotWsUrl: "ws://127.0.0.1:3103/", onebotHttpUrl: "http://127.0.0.1:3102/" },
       chat: { replyGroupAll: false, replyGroupAt: true, useEmoji: false } });
   }
+  if (PANEL_URL) {
+    const bot = getConfig().bot;
+    console.log(panelLaunchUrl(`http://${bot.panelHost || "127.0.0.1"}:${Number(bot.panelPort) || 5311}`));
+    return;
+  }
   // 第一次启动生成一个本机专用的协议端访问令牌（不写死公共值，见 config.mjs 注释）
   const tokenInfo = ensureLocalToken();
   const cfg = getConfig();
@@ -275,40 +283,7 @@ async function main() {
   }
 
   if (SELFTEST) {
-    /*
-     * 自检必须跑在「干净的数据目录」里。
-     *
-     * 以前它直接跑在真实数据目录上，于是「只应有一条」「第一次应该警告」这类断言会被
-     * 自己以前跑出来的历史数据绊倒（跑过一次真实聊天之后，私聊作用域里早就不止一条了）。
-     * 现在默认开一个临时数据目录重跑一遍，跑完删掉；想指定目录就自己设 HEARTECHO_DATA_DIR。
-     */
-    if (!process.env.HEARTECHO_DATA_DIR) {
-      const tempData = path.join(os.tmpdir(), `heartecho-selftest-${Date.now().toString(36)}`);
-      const { spawnSync } = await import("node:child_process");
-      const child = spawnSync(process.execPath, [...process.execArgv, ...process.argv.slice(1)], {
-        cwd: process.cwd(),
-        stdio: "inherit",
-        // 多实例的登记表 / 共用协议端 / 账号占位也必须指到临时目录：
-        // 打包后的自检会在「真实程序目录」里把 lib 模块先加载一遍，
-        // 这些环境变量必须在子进程启动前就设好，否则自检会碰到用户真实的协议端配置。
-        env: {
-          ...process.env,
-          HEARTECHO_DATA_DIR: tempData,
-          HEARTECHO_LOG_DIR: path.join(tempData, "logs"),
-          HEARTECHO_SELFTEST_TMP: tempData,
-          HEARTECHO_INSTANCES_HOME: path.join(tempData, "app"),
-          HEARTECHO_CLAIM_DIR: path.join(tempData, "claims"),
-        },
-      });
-      try {
-        fs.rmSync(tempData, { recursive: true, force: true });
-      } catch {
-        /* ignore */
-      }
-      closeDb();
-      process.exitCode = child.status ?? 1;
-      return;
-    }
+    // boot-env 在加载任何业务模块前创建独立临时数据目录。
     const { runSelfTest } = await import("./tools/selftest.mjs");
     await extensions.init({ setup: true, activate: false });
     const result = await runSelfTest({ client, llm, chat, qzone, extensions });
@@ -367,13 +342,14 @@ async function main() {
   /* ---------------------------- 常驻模式 ---------------------------- */
 
   const bootCfg = getConfig();
+  const accountConfigured = /^[1-9]\d{4,11}$/.test(String(bootCfg.bot.selfId ?? ""));
   const bootHost = bootCfg.bot.panelHost || "127.0.0.1";
   const bootPort = Number(bootCfg.bot.panelPort) || 5311;
 
   let lock = acquireLock();
   if (!lock.ok) {
     const otherAlive = await isPortListening(bootPort, bootHost);
-    if (otherAlive) {
+    if (otherAlive && !TAKEOVER) {
       // 真的还有一个实例在正常工作（用户多半是又双击了一次）。
       // 这时候最合理的反应不是报错，而是把他已经在跑的那个面板打开。
       log.info("心语已经在运行，改为打开它的控制面板");
@@ -414,7 +390,7 @@ async function main() {
    * 只看登记过的实例：手动复制出来的目录不在登记表里，这里看不到——
    * 那种情况留给 QQ 自己的顶号行为去暴露，错误信息里也会提示。
    */
-  try {
+  if (accountConfigured) try {
     const { findAccountHolder, claimAccount } = await import("./lib/instances.mjs");
     const holder = await findAccountHolder(bootCfg.bot.selfId, { excludeDir: paths.app, excludeDataDir: paths.data });
     if (holder) {
@@ -437,7 +413,7 @@ async function main() {
     }
   } catch (error) {
     log.warn(`检查账号占用失败（不影响启动）：${error?.message ?? error}`);
-  }
+  } else log.warn("机器人 QQ 号还没设置，请在面板完成配置并重启");
 
   /* ---------------------- 开机自启：只在打包版自动登记 ---------------------- */
 
@@ -598,7 +574,9 @@ async function main() {
   }
 
   // 先把协议端安排好，再连 QQ：否则用户只看到「未连接」，不知道是协议端没起
-  if (settingsNow.autoStartProtocol !== false) {
+  if (!accountConfigured) {
+    log.info("首次配置模式：暂不连接 QQ 或启动协议端");
+  } else if (settingsNow.autoStartProtocol !== false) {
     try {
       const protocol = await ensureProtocol({ autoStart: true });
       if (protocol.ok) {
@@ -615,9 +593,11 @@ async function main() {
     if (!quick.running) log.warn(`协议端没在运行（${quick.nextAction}）；自动启动已关闭`);
   }
 
-  client.start();
-  scheduler.start();
-  qzoneScheduler.start();
+  if (accountConfigured) {
+    client.start();
+    scheduler.start();
+    qzoneScheduler.start();
+  }
 
   // 天气：启动时先把缓存预热一次，这样聊天里她随时能提到「今天下雨」（失败的代价只是没有天气，不影响别的）
   if (getConfig().weather?.enabled !== false) {
@@ -675,9 +655,9 @@ async function main() {
    *   跑源码 → 只打印地址（开发方便），加 --tray 才弹窗口 + 托盘。
    *   --no-panel 只起托盘，--no-tray 只弹窗口不进托盘。
    */
-  const desktopMode = TRAY || isSea;
+  const desktopMode = TRAY || isSea || isInstalled;
   const wantTray = !NO_TRAY && desktopMode;
-  const wantWindow = !NO_PANEL && desktopMode && settingsNow.openPanelOnStart !== false;
+  const wantWindow = !NO_PANEL && (OPEN_PANEL || (desktopMode && settingsNow.openPanelOnStart !== false));
 
   // 托盘先起来：这样即使窗口打不开，用户也有地方点「打开控制面板」和「退出心语」
   if (wantTray) {
@@ -692,10 +672,10 @@ async function main() {
     }
   }
 
-  if (wantWindow) {
+  if (wantWindow && !listenError) {
     const opened = openPanelWindow(`http://${apiHost}:${apiPort}`);
     if (!opened.ok) log.warn(`没能自动打开窗口，请手动访问 http://${apiHost}:${apiPort}`);
-  } else {
+  } else if (!listenError) {
     log.info(`控制面板地址：http://${apiHost}:${apiPort}（加 --tray 会缩进托盘并弹窗口）`);
   }
 
@@ -726,7 +706,7 @@ async function main() {
       // 把「这个 QQ 号被我占着」的占位删掉，否则别的实例永远起不来
       try {
         const { releaseAccountClaim } = await import("./lib/instances.mjs");
-        releaseAccountClaim(bootCfg.bot.selfId);
+        if (accountConfigured) releaseAccountClaim(bootCfg.bot.selfId);
       } catch (error) {
         log.debug(`释放账号占位失败（占位里的进程已退出，会被下次启动自动忽略）：${error?.message ?? error}`);
       }
@@ -748,4 +728,9 @@ main().catch((error) => {
   log.error(`启动失败：${error?.stack ?? error}`);
   closeDb();
   process.exitCode = 1;
+}).finally(() => {
+  const owned = globalThis.__HEARTECHO_SELFTEST_OWNED;
+  if (owned && !has("--keep") && path.dirname(owned) === path.resolve(os.tmpdir()) && path.basename(owned).startsWith("heartecho-selftest-")) {
+    try { fs.rmSync(owned, { recursive: true, force: true }); } catch { /* 临时目录可稍后清理 */ }
+  }
 });

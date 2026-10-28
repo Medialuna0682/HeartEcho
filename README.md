@@ -31,8 +31,7 @@
      └── 控制面板 http://127.0.0.1:5311
 ```
 
-**协议端已经内置在 `protocol\` 目录里**，不需要另外安装、也不依赖项目外面的任何路径。
-心语启动时会自动检查它、没跑就自己拉起来，所以你只需要启动心语一个东西。
+源码仓库和现有打包工具不包含协议端。请自行安装 SnowLuma 或 NapCat，并在「运行环境」里设置协议端目录；配置完成后心语可尝试自动启动它。QQ 客户端也需另行安装并登录。
 
 日常使用就是**双击 `dist\心语.exe`**：不弹命令行窗口、自动连上 QQ、弹一个控制面板窗口、
 然后缩进右下角托盘；关掉窗口不会退出，开机也会自动起来。
@@ -166,6 +165,8 @@ node index.mjs --tray
 ```powershell
 node index.mjs                  # 正常启动（只打印面板地址，不弹窗）
 node index.mjs --tray           # 缩进托盘 + 弹应用窗口（推荐日常使用）
+node index.mjs --open-panel     # 启动时打开面板，即使设置里关闭了自动打开
+node index.mjs --panel-url      # 打印带本机凭据的面板地址；不要分享给他人
 node index.mjs --no-panel       # 不弹窗口，只在后台跑
 node index.mjs --no-tray        # 不缩托盘（只弹窗口）
 node index.mjs --probe          # 自检：配置、角色、模型、QQ 连通性，打印后退出
